@@ -1,0 +1,157 @@
+#VRML_SIM R2025a utf8
+
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/floors/protos/RectangleArena.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/appearances/protos/Parquetry.proto"
+
+WorldInfo {
+  title "A.M.A.S.O.N. Warehouse"
+}
+
+Viewpoint {
+}
+
+TexturedBackground {
+  texture "mountains"
+}
+
+TexturedBackgroundLight {
+  texture "mountains"
+}
+
+RectangleArena {
+  floorSize 5 5
+  floorTileSize 0.5 0.5
+  floorAppearance Parquetry {
+  }
+  wallThickness 0.01
+  wallHeight 0.1
+}
+
+Robot {
+  translation 0 0 0.1
+  children [
+    HingeJoint {
+      jointParameters HingeJointParameters {
+        axis 0 1 0
+        anchor 0 0.22 -0.025
+      }
+      device [
+        RotationalMotor {
+          name "left wheel motor"
+        }
+      ]
+      endPoint Solid {
+        translation 0 0.22 -0.025
+        rotation 1 0 0 1.5708
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.05 0.05 0.05
+              roughness 0.8
+              metalness 0
+            }
+            geometry Cylinder {
+              height 0.04
+              radius 0.075
+              subdivision 36
+            }
+          }
+        ]
+        name "Left wheel"
+        boundingObject Cylinder {
+          height 0.04
+          radius 0.075
+          subdivision 36
+        }
+        physics Physics {
+        }
+      }
+    }
+
+    HingeJoint {
+      jointParameters HingeJointParameters {
+        axis 0 1 0
+        anchor 0 -0.22 -0.025
+      }
+      device [
+        RotationalMotor {
+          name "right wheel motor"
+        }
+      ]
+      endPoint Solid {
+        translation 0 -0.22 -0.025
+        rotation 1 0 0 1.5708
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.05 0.05 0.05
+              roughness 0.8
+              metalness 0
+            }
+            geometry Cylinder {
+              height 0.04
+              radius 0.075
+              subdivision 36
+            }
+          }
+        ]
+        name "Right wheel"
+        boundingObject Cylinder {
+          height 0.04
+          radius 0.075
+          subdivision 36
+        }
+        physics Physics {
+        }
+      }
+    }
+
+    BallJoint {
+      jointParameters BallJointParameters {
+        anchor -0.18 0 -0.065
+      }
+      endPoint Solid {
+        translation -0.18 0 -0.065
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.05 0.05 0.05
+              roughness 0.8
+              metalness 0
+            }
+            geometry Sphere {
+              radius 0.035
+            }
+          }
+        ]
+        name "rear caster"
+        boundingObject Sphere {
+          radius 0.035
+        }
+        physics Physics {
+        }
+      }
+    }
+
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.196 0.196 0.196
+        roughness 0
+        metalness 1
+      }
+      geometry Box {
+        size 0.5 0.4 0.12
+      }
+    }
+  ]
+  name "AMASON"
+  boundingObject Box {
+    size 0.5 0.4 0.12
+  }
+  physics Physics {
+    mass 8
+  }
+  controller "<generic>"
+}

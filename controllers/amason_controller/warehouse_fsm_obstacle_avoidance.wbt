@@ -1,0 +1,526 @@
+"""A.M.A.S.O.N. Webots Controller
+
+Autonomous Mobile AI System for Optimized Navigation
+
+Current features:
+- Differential-drive motor control
+- GPS localization
+- InertialUnit heading/yaw
+- Left, center, and right distance sensors
+- Finite-state-machine obstacle avoidance
+- A* grid path planning
+"""
+
+from controller import Robot
+import math
+import heapq
+
+
+# =========================================================
+# ROBOT / SIMULATION SETUP
+# =========================================================
+
+robot = Robot()
+TIME_STEP = int(robot.getBasicTimeStep())
+
+
+# =========================================================
+# MOTORS
+# =========================================================
+
+left_motor = robot.getDevice("left wheel motor")
+right_motor = robot.getDevice("right wheel motor")
+
+# Velocity-control mode
+left_motor.setPosition(float("inf"))
+right_motor.setPosition(float("inf"))
+
+left_motor.setVelocity(0.0)
+right_motor.setVelocity(0.0)
+
+
+# =========================================================
+# GPS AND ORIENTATION SENSOR
+# =========================================================
+
+gps = robot.getDevice("gps")
+inertial_unit = robot.getDevice("inertial unit")
+
+gps.enable(TIME_STEP)
+inertial_unit.enable(TIME_STEP)
+
+
+# =========================================================
+# DISTANCE SENSORS
+# =========================================================
+
+front_sensor = robot.getDevice("front sensor")
+left_front_sensor = robot.getDevice("left front sensor")
+right_front_sensor = robot.getDevice("right front sensor")
+
+front_sensor.enable(TIME_STEP)
+left_front_sensor.enable(TIME_STEP)
+right_front_sensor.enable(TIME_STEP)
+
+
+# =========================================================
+# MOVEMENT SETTINGS
+# =========================================================
+
+FORWARD_SPEED = 1.0
+TURN_SPEED = 0.7
+
+# With our 0-1000 sensor lookup table:
+# 350 is approximately 0.35 meters.
+OBSTACLE_THRESHOLD = 350
+
+# Robot commits to a 30-degree avoidance turn.
+TURN_ANGLE = math.radians(30)
+
+
+# =========================================================
+# FINITE STATE MACHINE
+# =========================================================
+
+state = "FORWARD"
+turn_start_yaw = 0.0
+
+
+def angle_difference(current, start):
+    """
+    Calculate angular difference while correctly handling
+    the -pi / +pi wraparound.
+    """
+
+    difference = current - start
+
+    while difference > math.pi:
+        difference -= 2 * math.pi
+
+    while difference < -math.pi:
+        difference += 2 * math.pi
+
+    return difference
+
+
+# =========================================================
+# A* GRID SETTINGS
+# =========================================================
+
+ARENA_SIZE = 5.0
+CELL_SIZE = 0.25
+
+GRID_SIZE = int(ARENA_SIZE / CELL_SIZE)
+
+# 5-meter arena centered around 0:
+# -2.5 through +2.5 meters
+ARENA_MIN = -ARENA_SIZE / 2.0
+
+
+# =========================================================
+# GRID / WORLD CONVERSION
+# =========================================================
+
+def world_to_grid(x, y):
+    """
+    Convert Webots world coordinates into grid coordinates.
+    """
+
+    grid_x = int((x - ARENA_MIN) / CELL_SIZE)
+    grid_y = int((y - ARENA_MIN) / CELL_SIZE)
+
+    # Prevent coordinates from exceeding the grid.
+    grid_x = max(0, min(GRID_SIZE - 1, grid_x))
+    grid_y = max(0, min(GRID_SIZE - 1, grid_y))
+
+    return grid_x, grid_y
+
+
+def grid_to_world(grid_x, grid_y):
+    """
+    Convert grid coordinates to the center of a Webots
+    world-space grid cell.
+    """
+
+    x = ARENA_MIN + (grid_x + 0.5) * CELL_SIZE
+    y = ARENA_MIN + (grid_y + 0.5) * CELL_SIZE
+
+    return x, y
+
+
+# =========================================================
+# A* FUNCTIONS
+# =========================================================
+
+def heuristic(a, b):
+    """
+    Manhattan-distance heuristic.
+    """
+
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def a_star(grid, start, goal):
+    """
+    Calculate a path through the grid using A*.
+
+    0 = open cell
+    1 = blocked cell
+    """
+
+    open_set = []
+
+    # Entries are:
+    # (estimated total cost, cell)
+    heapq.heappush(open_set, (0, start))
+
+    came_from = {}
+
+    g_score = {
+        start: 0
+    }
+
+    while open_set:
+
+        _, current = heapq.heappop(open_set)
+
+        # -------------------------------------------------
+        # GOAL FOUND
+        # -------------------------------------------------
+
+        if current == goal:
+
+            path = [current]
+
+            while current in came_from:
+                current = came_from[current]
+                path.append(current)
+
+            path.reverse()
+
+            return path
+
+        x, y = current
+
+        # Four-direction movement
+        neighbors = [
+            (x + 1, y),
+            (x - 1, y),
+            (x, y + 1),
+            (x, y - 1)
+        ]
+
+        for neighbor in neighbors:
+
+            nx, ny = neighbor
+
+            # ---------------------------------------------
+            # GRID BOUNDARY CHECK
+            # ---------------------------------------------
+
+            if nx < 0 or nx >= GRID_SIZE:
+                continue
+
+            if ny < 0 or ny >= GRID_SIZE:
+                continue
+
+            # ---------------------------------------------
+            # OBSTACLE CHECK
+            # ---------------------------------------------
+
+            if grid[nx][ny] == 1:
+                continue
+
+            tentative_g = g_score[current] + 1
+
+            if (
+                neighbor not in g_score
+                or tentative_g < g_score[neighbor]
+            ):
+
+                came_from[neighbor] = current
+
+                g_score[neighbor] = tentative_g
+
+                f_score = (
+                    tentative_g
+                    + heuristic(neighbor, goal)
+                )
+
+                heapq.heappush(
+                    open_set,
+                    (f_score, neighbor)
+                )
+
+    # No route exists.
+    return None
+
+
+# =========================================================
+# CREATE THE A* MAP
+# =========================================================
+
+grid = [
+    [0 for _ in range(GRID_SIZE)]
+    for _ in range(GRID_SIZE)
+]
+
+
+# =========================================================
+# ADD TEST OBSTACLE TO GRID
+# =========================================================
+#
+# IMPORTANT:
+# Obstacles MUST be added BEFORE A* is executed.
+#
+# This creates a 3 x 3 blocked region.
+# =========================================================
+
+for gx in range(13, 16):
+    for gy in range(9, 12):
+        grid[gx][gy] = 1
+
+
+# =========================================================
+# A* TEST START AND GOAL
+# =========================================================
+
+START_WORLD = (0.0, 0.0)
+GOAL_WORLD = (1.75, 1.50)
+
+start_cell = world_to_grid(
+    START_WORLD[0],
+    START_WORLD[1]
+)
+
+goal_cell = world_to_grid(
+    GOAL_WORLD[0],
+    GOAL_WORLD[1]
+)
+
+
+# =========================================================
+# RUN A*
+# =========================================================
+
+path = a_star(
+    grid,
+    start_cell,
+    goal_cell
+)
+
+
+# =========================================================
+# PRINT A* RESULTS
+# =========================================================
+
+print()
+print("==========================================")
+print("A.M.A.S.O.N. A* PATH PLANNING TEST")
+print("==========================================")
+
+print("Grid size:",
+      GRID_SIZE,
+      "x",
+      GRID_SIZE)
+
+print("Cell size:",
+      CELL_SIZE,
+      "meters")
+
+print()
+
+print("Start world:",
+      START_WORLD)
+
+print("Goal world:",
+      GOAL_WORLD)
+
+print()
+
+print("Start cell:",
+      start_cell)
+
+print("Goal cell:",
+      goal_cell)
+
+print()
+
+
+if path is None:
+
+    print("ERROR: A* could not find a path.")
+
+else:
+
+    print("A* PATH FOUND")
+    print("Number of cells:", len(path))
+
+    print()
+
+    for cell in path:
+
+        world_point = grid_to_world(
+            cell[0],
+            cell[1]
+        )
+
+        print(
+            f"Grid {cell} -> "
+            f"World "
+            f"({world_point[0]:.2f}, "
+            f"{world_point[1]:.2f})"
+        )
+
+
+print("==========================================")
+print()
+
+
+# =========================================================
+# MAIN ROBOT CONTROL LOOP
+# =========================================================
+
+while robot.step(TIME_STEP) != -1:
+
+    # -----------------------------------------------------
+    # READ POSITION
+    # -----------------------------------------------------
+
+    position = gps.getValues()
+
+    x = position[0]
+    y = position[1]
+
+
+    # -----------------------------------------------------
+    # READ ORIENTATION
+    # -----------------------------------------------------
+
+    orientation = inertial_unit.getRollPitchYaw()
+
+    yaw = orientation[2]
+
+
+    # -----------------------------------------------------
+    # READ DISTANCE SENSORS
+    # -----------------------------------------------------
+
+    front_value = front_sensor.getValue()
+    left_value = left_front_sensor.getValue()
+    right_value = right_front_sensor.getValue()
+
+
+    # =====================================================
+    # FSM: FORWARD
+    # =====================================================
+
+    if state == "FORWARD":
+
+        left_motor.setVelocity(FORWARD_SPEED)
+        right_motor.setVelocity(FORWARD_SPEED)
+
+        # -------------------------------------------------
+        # OBSTACLE DIRECTLY AHEAD
+        # -------------------------------------------------
+
+        if front_value < OBSTACLE_THRESHOLD:
+
+            turn_start_yaw = yaw
+
+            # Choose the side with more available space.
+            #
+            # Larger sensor value = farther from obstacle.
+
+            if left_value > right_value:
+
+                state = "TURN_LEFT"
+
+            else:
+
+                state = "TURN_RIGHT"
+
+
+        # -------------------------------------------------
+        # OBSTACLE ON LEFT
+        # -------------------------------------------------
+
+        elif left_value < OBSTACLE_THRESHOLD:
+
+            turn_start_yaw = yaw
+
+            # Turn away from obstacle.
+            state = "TURN_RIGHT"
+
+
+        # -------------------------------------------------
+        # OBSTACLE ON RIGHT
+        # -------------------------------------------------
+
+        elif right_value < OBSTACLE_THRESHOLD:
+
+            turn_start_yaw = yaw
+
+            # Turn away from obstacle.
+            state = "TURN_LEFT"
+
+
+    # =====================================================
+    # FSM: TURN LEFT
+    # =====================================================
+
+    elif state == "TURN_LEFT":
+
+        # Rotate counterclockwise in place.
+        left_motor.setVelocity(-TURN_SPEED)
+        right_motor.setVelocity(TURN_SPEED)
+
+        amount_turned = abs(
+            angle_difference(
+                yaw,
+                turn_start_yaw
+            )
+        )
+
+        # Complete the entire 30-degree turn.
+        if amount_turned >= TURN_ANGLE:
+
+            state = "FORWARD"
+
+
+    # =====================================================
+    # FSM: TURN RIGHT
+    # =====================================================
+
+    elif state == "TURN_RIGHT":
+
+        # Rotate clockwise in place.
+        left_motor.setVelocity(TURN_SPEED)
+        right_motor.setVelocity(-TURN_SPEED)
+
+        amount_turned = abs(
+            angle_difference(
+                yaw,
+                turn_start_yaw
+            )
+        )
+
+        # Complete the entire 30-degree turn.
+        if amount_turned >= TURN_ANGLE:
+
+            state = "FORWARD"
+
+
+    # =====================================================
+    # DEBUG OUTPUT
+    # =====================================================
+
+    print(
+        f"X={x:.3f}, "
+        f"Y={y:.3f}, "
+        f"Yaw={yaw:.3f}, "
+        f"Left={left_value:.1f}, "
+        f"Front={front_value:.1f}, "
+        f"Right={right_value:.1f}, "
+        f"State={state}"
+    )
