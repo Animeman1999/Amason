@@ -9,9 +9,10 @@ Features:
 - Three distance sensors
 - A* path planning
 - Static obstacle mapping
+- Temporary obstacle mapping
+- Dynamic A* replanning
 - Waypoint following
 - Finite-state-machine navigation
-- Reactive obstacle avoidance
 """
 
 from controller import Robot
@@ -59,7 +60,9 @@ inertial_orientation_sensor = amason_robot.getDevice(
     "inertial unit"
 )
 
-gps_sensor.enable(SIMULATION_TIME_STEP)
+gps_sensor.enable(
+    SIMULATION_TIME_STEP
+)
 
 inertial_orientation_sensor.enable(
     SIMULATION_TIME_STEP
@@ -100,24 +103,91 @@ right_front_distance_sensor.enable(
 # =========================================================
 
 FORWARD_WHEEL_SPEED = 1.0
+
 TURNING_WHEEL_SPEED = 0.7
 
-# With the sensor lookup table:
-# 0 meters   = 0
-# 1 meter    = 1000
-#
-# 300 is approximately 30 centimeters.
-OBSTACLE_DETECTION_THRESHOLD = 300
-
-# Robot must be within approximately 5 degrees of the
-# desired heading before driving toward a waypoint.
 WAYPOINT_HEADING_TOLERANCE = math.radians(5)
 
-# Waypoint is reached when the robot is within 10 cm.
 WAYPOINT_DISTANCE_TOLERANCE = 0.10
 
-# Emergency/reactive avoidance turn.
-OBSTACLE_AVOIDANCE_TURN_ANGLE = math.radians(30)
+
+# =========================================================
+# DYNAMIC OBSTACLE SETTINGS
+# =========================================================
+
+# A new obstacle is initially detected below this value.
+#
+# With the current sensor lookup table:
+#
+# 0 meters = 0
+# 1 meter  = 1000
+#
+# Therefore 300 is approximately 0.30 meters.
+OBSTACLE_DETECTION_THRESHOLD = 300
+
+
+# Once confirmation begins, the obstacle must become
+# farther away than this value before being considered
+# cleared.
+#
+# This provides hysteresis and prevents readings near
+# 299-300 from repeatedly switching between detected
+# and clear.
+OBSTACLE_CLEAR_THRESHOLD = 350
+
+
+# An unexpected obstacle must remain visible this long
+# before it is added to the temporary map.
+OBSTACLE_CONFIRMATION_TIME_SECONDS = 0.50
+
+
+# Temporary obstacles are forgotten after this amount of
+# time unless the robot sees the same obstacle again.
+TEMPORARY_OBSTACLE_LIFETIME_SECONDS = 30.0
+
+
+# A detected obstacle blocks its grid cell plus this many
+# neighboring cells in each direction.
+#
+# 1 creates a 3 x 3 blocked region.
+TEMPORARY_OBSTACLE_INFLATION_CELLS = 1
+
+
+# Sensor position estimates can change slightly as the
+# robot moves. Treat detections within this many cells as
+# being the same temporary obstacle.
+TEMPORARY_OBSTACLE_MATCH_RADIUS_CELLS = 1
+
+
+# If no path can currently be found, wait this long before
+# trying A* again.
+PATH_RETRY_INTERVAL_SECONDS = 1.0
+
+
+# =========================================================
+# SENSOR MOUNTING LOCATIONS
+# =========================================================
+#
+# Robot coordinate system:
+#
+# +X = robot forward
+# +Y = robot left
+#
+# =========================================================
+
+FRONT_SENSOR_LOCAL_X = 0.255
+FRONT_SENSOR_LOCAL_Y = 0.0
+FRONT_SENSOR_ANGLE = 0.0
+
+
+LEFT_SENSOR_LOCAL_X = 0.245
+LEFT_SENSOR_LOCAL_Y = 0.15
+LEFT_SENSOR_ANGLE = math.radians(30)
+
+
+RIGHT_SENSOR_LOCAL_X = 0.245
+RIGHT_SENSOR_LOCAL_Y = -0.15
+RIGHT_SENSOR_ANGLE = math.radians(-30)
 
 
 # =========================================================
@@ -129,7 +199,8 @@ ARENA_SIZE_METERS = 5.0
 GRID_CELL_SIZE_METERS = 0.25
 
 GRID_CELL_COUNT = int(
-    ARENA_SIZE_METERS / GRID_CELL_SIZE_METERS
+    ARENA_SIZE_METERS
+    / GRID_CELL_SIZE_METERS
 )
 
 ARENA_MINIMUM_COORDINATE = (
@@ -139,19 +210,6 @@ ARENA_MINIMUM_COORDINATE = (
 
 # =========================================================
 # STATIC OBSTACLE SETTINGS
-# =========================================================
-#
-# Box:
-# translation 1.2 0.4 0.15
-#
-# Box2:
-# translation 0.7 1.1 0.15
-#
-# These size values assume both Webots Box geometries are:
-#
-# size 0.2 0.4 0.3
-#
-# Only X and Y matter for the A* map.
 # =========================================================
 
 BOX_ONE_CENTER_X = 1.20
@@ -168,11 +226,7 @@ BOX_TWO_SIZE_X = 0.20
 BOX_TWO_SIZE_Y = 0.40
 
 
-# Extra clearance around each obstacle.
-#
-# This prevents A* from planning a path where the center
-# of the robot technically clears the box but the chassis
-# or wheels are too close.
+# Extra clearance around known obstacles.
 STATIC_OBSTACLE_SAFETY_MARGIN = 0.30
 
 
@@ -186,7 +240,7 @@ ROBOT_START_WORLD_POSITION = (
 )
 
 ROBOT_GOAL_WORLD_POSITION = (
-    1.7,
+    1.8,
     1.20
 )
 
@@ -195,37 +249,27 @@ ROBOT_GOAL_WORLD_POSITION = (
 # ANGLE FUNCTIONS
 # =========================================================
 
-def normalize_angle_radians(angle_radians):
+def normalize_angle_radians(
+    angle_radians
+):
     """
-    Normalize an angle to the range -pi through +pi.
+    Normalize an angle to the range
+    -pi through +pi.
     """
 
     while angle_radians > math.pi:
-        angle_radians -= 2 * math.pi
+
+        angle_radians -= (
+            2 * math.pi
+        )
 
     while angle_radians < -math.pi:
-        angle_radians += 2 * math.pi
+
+        angle_radians += (
+            2 * math.pi
+        )
 
     return angle_radians
-
-
-def calculate_angle_difference(
-    current_angle_radians,
-    starting_angle_radians
-):
-    """
-    Calculate the normalized angular difference between
-    a current orientation and a starting orientation.
-    """
-
-    angle_difference_radians = (
-        current_angle_radians
-        - starting_angle_radians
-    )
-
-    return normalize_angle_radians(
-        angle_difference_radians
-    )
 
 
 # =========================================================
@@ -237,7 +281,8 @@ def convert_world_position_to_grid_cell(
     world_y_position
 ):
     """
-    Convert Webots world coordinates into grid coordinates.
+    Convert Webots world coordinates into
+    occupancy-grid coordinates.
     """
 
     grid_column = int(
@@ -283,19 +328,24 @@ def convert_grid_cell_to_world_position(
     grid_row
 ):
     """
-    Convert a grid cell into the Webots world coordinates
-    at the center of the cell.
+    Convert a grid cell into the Webots
+    world coordinates at the center of
+    the cell.
     """
 
     world_x_position = (
         ARENA_MINIMUM_COORDINATE
-        + (grid_column + 0.5)
+        + (
+            grid_column + 0.5
+        )
         * GRID_CELL_SIZE_METERS
     )
 
     world_y_position = (
         ARENA_MINIMUM_COORDINATE
-        + (grid_row + 0.5)
+        + (
+            grid_row + 0.5
+        )
         * GRID_CELL_SIZE_METERS
     )
 
@@ -306,8 +356,46 @@ def convert_grid_cell_to_world_position(
 
 
 # =========================================================
-# STATIC OBSTACLE MAPPING
+# OCCUPANCY GRID FUNCTIONS
 # =========================================================
+
+def create_empty_occupancy_grid():
+    """
+    Create an empty occupancy grid.
+
+    0 = open cell
+    1 = blocked cell
+    """
+
+    return [
+        [
+            0
+            for grid_row
+            in range(
+                GRID_CELL_COUNT
+            )
+        ]
+        for grid_column
+        in range(
+            GRID_CELL_COUNT
+        )
+    ]
+
+
+def copy_occupancy_grid(
+    source_grid
+):
+    """
+    Create an independent copy of an
+    occupancy grid.
+    """
+
+    return [
+        grid_column.copy()
+        for grid_column
+        in source_grid
+    ]
+
 
 def mark_rectangular_obstacle_on_grid(
     occupancy_grid,
@@ -318,10 +406,8 @@ def mark_rectangular_obstacle_on_grid(
     safety_margin
 ):
     """
-    Mark grid cells occupied by a rectangular obstacle.
-
-    The safety margin expands the blocked area so that the
-    robot's chassis and wheels maintain clearance.
+    Mark a known rectangular obstacle
+    on the occupancy grid.
     """
 
     obstacle_minimum_x = (
@@ -351,17 +437,21 @@ def mark_rectangular_obstacle_on_grid(
     (
         minimum_grid_column,
         minimum_grid_row
-    ) = convert_world_position_to_grid_cell(
-        obstacle_minimum_x,
-        obstacle_minimum_y
+    ) = (
+        convert_world_position_to_grid_cell(
+            obstacle_minimum_x,
+            obstacle_minimum_y
+        )
     )
 
     (
         maximum_grid_column,
         maximum_grid_row
-    ) = convert_world_position_to_grid_cell(
-        obstacle_maximum_x,
-        obstacle_maximum_y
+    ) = (
+        convert_world_position_to_grid_cell(
+            obstacle_maximum_x,
+            obstacle_maximum_y
+        )
     )
 
     for obstacle_grid_column in range(
@@ -381,6 +471,257 @@ def mark_rectangular_obstacle_on_grid(
             ] = 1
 
 
+def mark_temporary_obstacle_on_grid(
+    occupancy_grid,
+    obstacle_grid_cell
+):
+    """
+    Mark a temporary obstacle and its
+    surrounding safety cells as blocked.
+    """
+
+    obstacle_grid_column = (
+        obstacle_grid_cell[0]
+    )
+
+    obstacle_grid_row = (
+        obstacle_grid_cell[1]
+    )
+
+    for column_offset in range(
+        -TEMPORARY_OBSTACLE_INFLATION_CELLS,
+        TEMPORARY_OBSTACLE_INFLATION_CELLS + 1
+    ):
+
+        for row_offset in range(
+            -TEMPORARY_OBSTACLE_INFLATION_CELLS,
+            TEMPORARY_OBSTACLE_INFLATION_CELLS + 1
+        ):
+
+            blocked_grid_column = (
+                obstacle_grid_column
+                + column_offset
+            )
+
+            blocked_grid_row = (
+                obstacle_grid_row
+                + row_offset
+            )
+
+            if (
+                0
+                <= blocked_grid_column
+                < GRID_CELL_COUNT
+                and
+                0
+                <= blocked_grid_row
+                < GRID_CELL_COUNT
+            ):
+
+                occupancy_grid[
+                    blocked_grid_column
+                ][
+                    blocked_grid_row
+                ] = 1
+
+
+# =========================================================
+# TEMPORARY OBSTACLE MEMORY
+# =========================================================
+#
+# Dictionary format:
+#
+# {
+#     (grid_column, grid_row):
+#         last_detection_time
+# }
+#
+# =========================================================
+
+temporary_obstacles = {}
+
+
+def remove_expired_temporary_obstacles(
+    current_simulation_time
+):
+    """
+    Remove temporary obstacles that have
+    not been detected recently.
+    """
+
+    expired_obstacle_cells = []
+
+    for (
+        obstacle_grid_cell,
+        last_detection_time
+    ) in temporary_obstacles.items():
+
+        obstacle_age_seconds = (
+            current_simulation_time
+            - last_detection_time
+        )
+
+        if (
+            obstacle_age_seconds
+            >
+            TEMPORARY_OBSTACLE_LIFETIME_SECONDS
+        ):
+
+            expired_obstacle_cells.append(
+                obstacle_grid_cell
+            )
+
+    for obstacle_grid_cell in (
+        expired_obstacle_cells
+    ):
+
+        del temporary_obstacles[
+            obstacle_grid_cell
+        ]
+
+        print(
+            "Temporary obstacle expired:",
+            obstacle_grid_cell
+        )
+
+
+def find_matching_temporary_obstacle(
+    detected_grid_cell
+):
+    """
+    Determine whether a newly estimated
+    obstacle position corresponds to an
+    obstacle already stored in memory.
+    """
+
+    detected_grid_column = (
+        detected_grid_cell[0]
+    )
+
+    detected_grid_row = (
+        detected_grid_cell[1]
+    )
+
+    for existing_grid_cell in (
+        temporary_obstacles.keys()
+    ):
+
+        existing_grid_column = (
+            existing_grid_cell[0]
+        )
+
+        existing_grid_row = (
+            existing_grid_cell[1]
+        )
+
+        column_difference = abs(
+            existing_grid_column
+            - detected_grid_column
+        )
+
+        row_difference = abs(
+            existing_grid_row
+            - detected_grid_row
+        )
+
+        if (
+            column_difference
+            <=
+            TEMPORARY_OBSTACLE_MATCH_RADIUS_CELLS
+            and
+            row_difference
+            <=
+            TEMPORARY_OBSTACLE_MATCH_RADIUS_CELLS
+        ):
+
+            return existing_grid_cell
+
+    return None
+
+
+def add_or_refresh_temporary_obstacle(
+    detected_grid_cell,
+    current_simulation_time
+):
+    """
+    Add a newly discovered obstacle or
+    refresh an existing nearby obstacle.
+    """
+
+    matching_obstacle_cell = (
+        find_matching_temporary_obstacle(
+            detected_grid_cell
+        )
+    )
+
+    if matching_obstacle_cell is not None:
+
+        temporary_obstacles[
+            matching_obstacle_cell
+        ] = current_simulation_time
+
+        return matching_obstacle_cell
+
+    temporary_obstacles[
+        detected_grid_cell
+    ] = current_simulation_time
+
+    return detected_grid_cell
+
+
+def build_current_occupancy_grid(
+    current_simulation_time
+):
+    """
+    Build the current planning map using:
+
+    - known static obstacles
+    - remembered temporary obstacles
+    """
+
+    remove_expired_temporary_obstacles(
+        current_simulation_time
+    )
+
+    combined_occupancy_grid = (
+        copy_occupancy_grid(
+            static_occupancy_grid
+        )
+    )
+
+    for obstacle_grid_cell in (
+        temporary_obstacles.keys()
+    ):
+
+        mark_temporary_obstacle_on_grid(
+            combined_occupancy_grid,
+            obstacle_grid_cell
+        )
+
+    return combined_occupancy_grid
+
+
+def grid_cell_is_static_obstacle(
+    grid_cell
+):
+    """
+    Determine whether a detected grid cell
+    is already part of the known static map.
+    """
+
+    grid_column = grid_cell[0]
+    grid_row = grid_cell[1]
+
+    return (
+        static_occupancy_grid[
+            grid_column
+        ][
+            grid_row
+        ]
+        == 1
+    )
+
+
 # =========================================================
 # A* FUNCTIONS
 # =========================================================
@@ -390,7 +731,8 @@ def calculate_manhattan_distance(
     second_grid_cell
 ):
     """
-    Calculate Manhattan distance between two grid cells.
+    Calculate Manhattan distance between
+    two grid cells.
     """
 
     column_distance = abs(
@@ -417,9 +759,12 @@ def calculate_astar_path(
     """
     Calculate an optimal grid path using A*.
 
-    Grid values:
-        0 = open
-        1 = obstacle
+    Movement is limited to four directions:
+
+    - left
+    - right
+    - forward grid row
+    - backward grid row
     """
 
     frontier_priority_queue = []
@@ -451,7 +796,10 @@ def calculate_astar_path(
         # GOAL FOUND
         # -------------------------------------------------
 
-        if current_grid_cell == goal_grid_cell:
+        if (
+            current_grid_cell
+            == goal_grid_cell
+        ):
 
             calculated_path = [
                 current_grid_cell
@@ -476,29 +824,36 @@ def calculate_astar_path(
 
             return calculated_path
 
+
         (
             current_grid_column,
             current_grid_row
         ) = current_grid_cell
 
+
         neighboring_grid_cells = [
+
             (
                 current_grid_column + 1,
                 current_grid_row
             ),
+
             (
                 current_grid_column - 1,
                 current_grid_row
             ),
+
             (
                 current_grid_column,
                 current_grid_row + 1
             ),
+
             (
                 current_grid_column,
                 current_grid_row - 1
             )
         ]
+
 
         for neighboring_grid_cell in (
             neighboring_grid_cells
@@ -509,23 +864,29 @@ def calculate_astar_path(
                 neighboring_grid_row
             ) = neighboring_grid_cell
 
+
             # ---------------------------------------------
             # GRID BOUNDARY CHECK
             # ---------------------------------------------
 
             if (
                 neighboring_grid_column < 0
-                or neighboring_grid_column
+                or
+                neighboring_grid_column
                 >= GRID_CELL_COUNT
             ):
+
                 continue
 
             if (
                 neighboring_grid_row < 0
-                or neighboring_grid_row
+                or
+                neighboring_grid_row
                 >= GRID_CELL_COUNT
             ):
+
                 continue
+
 
             # ---------------------------------------------
             # OBSTACLE CHECK
@@ -539,7 +900,9 @@ def calculate_astar_path(
                 ]
                 == 1
             ):
+
                 continue
+
 
             new_movement_cost_from_start = (
                 movement_cost_from_start[
@@ -548,12 +911,14 @@ def calculate_astar_path(
                 + 1
             )
 
+
             if (
                 neighboring_grid_cell
                 not in movement_cost_from_start
                 or
                 new_movement_cost_from_start
-                < movement_cost_from_start[
+                <
+                movement_cost_from_start[
                     neighboring_grid_cell
                 ]
             ):
@@ -570,7 +935,8 @@ def calculate_astar_path(
 
                 estimated_total_path_cost = (
                     new_movement_cost_from_start
-                    + calculate_manhattan_distance(
+                    +
+                    calculate_manhattan_distance(
                         neighboring_grid_cell,
                         goal_grid_cell
                     )
@@ -588,50 +954,344 @@ def calculate_astar_path(
 
 
 # =========================================================
-# CREATE OCCUPANCY GRID
+# WAYPOINT CREATION
 # =========================================================
 
-occupancy_grid = [
-    [
-        0
-        for grid_row
-        in range(GRID_CELL_COUNT)
-    ]
-    for grid_column
-    in range(GRID_CELL_COUNT)
-]
+def create_navigation_waypoints(
+    planned_path
+):
+    """
+    Convert an A* grid path into Webots
+    world-space navigation waypoints.
+    """
+
+    new_navigation_waypoints = []
+
+    if planned_path is None:
+
+        return (
+            new_navigation_waypoints
+        )
+
+    # Skip path[0] because it is the cell
+    # containing the robot's current location.
+    for path_grid_cell in (
+        planned_path[1:]
+    ):
+
+        world_space_waypoint = (
+            convert_grid_cell_to_world_position(
+                path_grid_cell[0],
+                path_grid_cell[1]
+            )
+        )
+
+        new_navigation_waypoints.append(
+            world_space_waypoint
+        )
+
+    # Use the exact requested goal coordinate
+    # instead of the center of the final cell.
+    if (
+        len(
+            new_navigation_waypoints
+        )
+        > 0
+    ):
+
+        new_navigation_waypoints[-1] = (
+            ROBOT_GOAL_WORLD_POSITION
+        )
+
+    return (
+        new_navigation_waypoints
+    )
 
 
 # =========================================================
-# ADD BOX ONE TO A* MAP
+# SENSOR FUNCTIONS
 # =========================================================
 
-mark_rectangular_obstacle_on_grid(
-    occupancy_grid=occupancy_grid,
-    obstacle_center_x=BOX_ONE_CENTER_X,
-    obstacle_center_y=BOX_ONE_CENTER_Y,
-    obstacle_size_x=BOX_ONE_SIZE_X,
-    obstacle_size_y=BOX_ONE_SIZE_Y,
-    safety_margin=STATIC_OBSTACLE_SAFETY_MARGIN
+def convert_sensor_value_to_meters(
+    sensor_value
+):
+    """
+    Convert the current 0-1000 sensor value
+    into approximate meters.
+    """
+
+    return (
+        sensor_value / 1000.0
+    )
+
+
+def find_closest_detected_obstacle(
+    front_sensor_value,
+    left_sensor_value,
+    right_sensor_value,
+    detection_threshold
+):
+    """
+    Return information about the closest
+    detected obstacle below the supplied
+    threshold.
+    """
+
+    possible_detections = []
+
+
+    if (
+        front_sensor_value
+        < detection_threshold
+    ):
+
+        possible_detections.append(
+            {
+                "sensor_name": "FRONT",
+                "sensor_value":
+                    front_sensor_value,
+                "local_x":
+                    FRONT_SENSOR_LOCAL_X,
+                "local_y":
+                    FRONT_SENSOR_LOCAL_Y,
+                "sensor_angle":
+                    FRONT_SENSOR_ANGLE
+            }
+        )
+
+
+    if (
+        left_sensor_value
+        < detection_threshold
+    ):
+
+        possible_detections.append(
+            {
+                "sensor_name": "LEFT",
+                "sensor_value":
+                    left_sensor_value,
+                "local_x":
+                    LEFT_SENSOR_LOCAL_X,
+                "local_y":
+                    LEFT_SENSOR_LOCAL_Y,
+                "sensor_angle":
+                    LEFT_SENSOR_ANGLE
+            }
+        )
+
+
+    if (
+        right_sensor_value
+        < detection_threshold
+    ):
+
+        possible_detections.append(
+            {
+                "sensor_name": "RIGHT",
+                "sensor_value":
+                    right_sensor_value,
+                "local_x":
+                    RIGHT_SENSOR_LOCAL_X,
+                "local_y":
+                    RIGHT_SENSOR_LOCAL_Y,
+                "sensor_angle":
+                    RIGHT_SENSOR_ANGLE
+            }
+        )
+
+
+    if (
+        len(
+            possible_detections
+        )
+        == 0
+    ):
+
+        return None
+
+
+    return min(
+        possible_detections,
+        key=lambda detection:
+            detection[
+                "sensor_value"
+            ]
+    )
+
+
+def estimate_obstacle_world_position(
+    robot_world_x_position,
+    robot_world_y_position,
+    robot_current_yaw,
+    obstacle_detection
+):
+    """
+    Estimate obstacle world position using:
+
+    - GPS robot position
+    - robot yaw
+    - sensor mounting position
+    - sensor mounting angle
+    - measured distance
+    """
+
+    sensor_local_x = (
+        obstacle_detection[
+            "local_x"
+        ]
+    )
+
+    sensor_local_y = (
+        obstacle_detection[
+            "local_y"
+        ]
+    )
+
+    obstacle_distance_meters = (
+        convert_sensor_value_to_meters(
+            obstacle_detection[
+                "sensor_value"
+            ]
+        )
+    )
+
+
+    # -----------------------------------------------------
+    # SENSOR WORLD POSITION
+    # -----------------------------------------------------
+
+    sensor_world_x = (
+        robot_world_x_position
+        +
+        sensor_local_x
+        * math.cos(
+            robot_current_yaw
+        )
+        -
+        sensor_local_y
+        * math.sin(
+            robot_current_yaw
+        )
+    )
+
+    sensor_world_y = (
+        robot_world_y_position
+        +
+        sensor_local_x
+        * math.sin(
+            robot_current_yaw
+        )
+        +
+        sensor_local_y
+        * math.cos(
+            robot_current_yaw
+        )
+    )
+
+
+    # -----------------------------------------------------
+    # SENSOR WORLD HEADING
+    # -----------------------------------------------------
+
+    sensor_world_heading = (
+        robot_current_yaw
+        +
+        obstacle_detection[
+            "sensor_angle"
+        ]
+    )
+
+
+    # -----------------------------------------------------
+    # ESTIMATED OBSTACLE LOCATION
+    # -----------------------------------------------------
+
+    estimated_obstacle_world_x = (
+        sensor_world_x
+        +
+        obstacle_distance_meters
+        * math.cos(
+            sensor_world_heading
+        )
+    )
+
+    estimated_obstacle_world_y = (
+        sensor_world_y
+        +
+        obstacle_distance_meters
+        * math.sin(
+            sensor_world_heading
+        )
+    )
+
+
+    return (
+        estimated_obstacle_world_x,
+        estimated_obstacle_world_y
+    )
+
+
+# =========================================================
+# CREATE STATIC OCCUPANCY GRID
+# =========================================================
+
+static_occupancy_grid = (
+    create_empty_occupancy_grid()
 )
 
 
 # =========================================================
-# ADD BOX TWO TO A* MAP
+# ADD KNOWN BOX ONE
 # =========================================================
 
 mark_rectangular_obstacle_on_grid(
-    occupancy_grid=occupancy_grid,
-    obstacle_center_x=BOX_TWO_CENTER_X,
-    obstacle_center_y=BOX_TWO_CENTER_Y,
-    obstacle_size_x=BOX_TWO_SIZE_X,
-    obstacle_size_y=BOX_TWO_SIZE_Y,
-    safety_margin=STATIC_OBSTACLE_SAFETY_MARGIN
+    occupancy_grid=
+        static_occupancy_grid,
+
+    obstacle_center_x=
+        BOX_ONE_CENTER_X,
+
+    obstacle_center_y=
+        BOX_ONE_CENTER_Y,
+
+    obstacle_size_x=
+        BOX_ONE_SIZE_X,
+
+    obstacle_size_y=
+        BOX_ONE_SIZE_Y,
+
+    safety_margin=
+        STATIC_OBSTACLE_SAFETY_MARGIN
 )
 
 
 # =========================================================
-# START AND GOAL GRID CELLS
+# ADD KNOWN BOX TWO
+# =========================================================
+
+mark_rectangular_obstacle_on_grid(
+    occupancy_grid=
+        static_occupancy_grid,
+
+    obstacle_center_x=
+        BOX_TWO_CENTER_X,
+
+    obstacle_center_y=
+        BOX_TWO_CENTER_Y,
+
+    obstacle_size_x=
+        BOX_TWO_SIZE_X,
+
+    obstacle_size_y=
+        BOX_TWO_SIZE_Y,
+
+    safety_margin=
+        STATIC_OBSTACLE_SAFETY_MARGIN
+)
+
+
+# =========================================================
+# INITIAL A* PATH
 # =========================================================
 
 starting_grid_cell = (
@@ -649,59 +1309,43 @@ goal_grid_cell = (
 )
 
 
-# =========================================================
-# CALCULATE A* PATH
-# =========================================================
+current_occupancy_grid = (
+    build_current_occupancy_grid(
+        amason_robot.getTime()
+    )
+)
 
-planned_grid_path = calculate_astar_path(
-    occupancy_grid,
-    starting_grid_cell,
-    goal_grid_cell
+
+planned_grid_path = (
+    calculate_astar_path(
+        current_occupancy_grid,
+        starting_grid_cell,
+        goal_grid_cell
+    )
+)
+
+
+navigation_waypoints = (
+    create_navigation_waypoints(
+        planned_grid_path
+    )
 )
 
 
 # =========================================================
-# CREATE WORLD-SPACE WAYPOINTS
-# =========================================================
-
-navigation_waypoints = []
-
-if planned_grid_path is not None:
-
-    # Skip the first cell because the robot already
-    # occupies the starting grid cell.
-    for path_grid_cell in planned_grid_path[1:]:
-
-        world_space_waypoint = (
-            convert_grid_cell_to_world_position(
-                path_grid_cell[0],
-                path_grid_cell[1]
-            )
-        )
-
-        navigation_waypoints.append(
-            world_space_waypoint
-        )
-
-    # Use the exact requested goal for the final waypoint.
-    if len(navigation_waypoints) > 0:
-
-        navigation_waypoints[-1] = (
-            ROBOT_GOAL_WORLD_POSITION
-        )
-
-
-# =========================================================
-# PRINT PLANNED PATH
+# PRINT INITIAL ROUTE
 # =========================================================
 
 print()
+
 print(
     "=========================================="
 )
+
 print(
     "A.M.A.S.O.N. AUTONOMOUS NAVIGATION"
 )
+
 print(
     "=========================================="
 )
@@ -716,39 +1360,32 @@ print(
     ROBOT_GOAL_WORLD_POSITION
 )
 
-print(
-    "Start cell:",
-    starting_grid_cell
-)
-
-print(
-    "Goal cell:",
-    goal_grid_cell
-)
-
-print()
 
 if planned_grid_path is None:
 
     print(
-        "ERROR: A* COULD NOT FIND A PATH"
+        "ERROR: A* COULD NOT FIND AN INITIAL PATH"
     )
 
 else:
 
-    print("A* PATH FOUND")
+    print(
+        "Initial A* path found."
+    )
 
     print(
         "Grid cells:",
-        len(planned_grid_path)
+        len(
+            planned_grid_path
+        )
     )
 
     print(
         "Navigation waypoints:",
-        len(navigation_waypoints)
+        len(
+            navigation_waypoints
+        )
     )
-
-    print()
 
     for (
         waypoint_number,
@@ -764,6 +1401,7 @@ else:
             f"Y={waypoint_world_position[1]:.3f}"
         )
 
+
 print(
     "=========================================="
 )
@@ -777,19 +1415,29 @@ print()
 
 if (
     planned_grid_path is None
-    or len(navigation_waypoints) == 0
+    or
+    len(
+        navigation_waypoints
+    )
+    == 0
 ):
 
-    navigation_state = "STOPPED"
+    navigation_state = (
+        "STOPPED"
+    )
 
 else:
 
-    navigation_state = "TURN_TO_WAYPOINT"
+    navigation_state = (
+        "TURN_TO_WAYPOINT"
+    )
 
 
 current_waypoint_index = 0
 
-obstacle_avoidance_start_yaw = 0.0
+obstacle_confirmation_start_time = 0.0
+
+last_path_retry_time = 0.0
 
 
 # =========================================================
@@ -802,6 +1450,11 @@ while (
     )
     != -1
 ):
+
+    current_simulation_time = (
+        amason_robot.getTime()
+    )
+
 
     # -----------------------------------------------------
     # CURRENT POSITION
@@ -852,12 +1505,111 @@ while (
 
 
     # =====================================================
-    # CHECK FOR COMPLETED NAVIGATION
+    # FIND CLOSEST DETECTED OBSTACLE
+    # =====================================================
+
+    closest_obstacle_detection = (
+        find_closest_detected_obstacle(
+            front_obstacle_distance_value,
+            left_obstacle_distance_value,
+            right_obstacle_distance_value,
+            OBSTACLE_DETECTION_THRESHOLD
+        )
+    )
+
+
+    detected_obstacle_grid_cell = None
+
+    matching_temporary_obstacle_cell = None
+
+    detection_is_known_static_obstacle = False
+
+
+    # =====================================================
+    # ESTIMATE OBSTACLE POSITION
     # =====================================================
 
     if (
+        closest_obstacle_detection
+        is not None
+    ):
+
+        (
+            estimated_obstacle_world_x,
+            estimated_obstacle_world_y
+        ) = (
+            estimate_obstacle_world_position(
+                robot_world_x_position,
+                robot_world_y_position,
+                robot_current_yaw,
+                closest_obstacle_detection
+            )
+        )
+
+
+        detected_obstacle_grid_cell = (
+            convert_world_position_to_grid_cell(
+                estimated_obstacle_world_x,
+                estimated_obstacle_world_y
+            )
+        )
+
+
+        # -------------------------------------------------
+        # IS IT ALREADY A KNOWN STATIC OBSTACLE?
+        # -------------------------------------------------
+
+        detection_is_known_static_obstacle = (
+            grid_cell_is_static_obstacle(
+                detected_obstacle_grid_cell
+            )
+        )
+
+
+        # -------------------------------------------------
+        # IS IT ALREADY A TEMPORARY OBSTACLE?
+        # -------------------------------------------------
+
+        matching_temporary_obstacle_cell = (
+            find_matching_temporary_obstacle(
+                detected_obstacle_grid_cell
+            )
+        )
+
+
+        # -------------------------------------------------
+        # REFRESH KNOWN TEMPORARY OBSTACLE
+        # -------------------------------------------------
+        #
+        # Seeing the same temporary obstacle again should
+        # NOT trigger another A* replan.
+        # -------------------------------------------------
+
+        if (
+            matching_temporary_obstacle_cell
+            is not None
+        ):
+
+            temporary_obstacles[
+                matching_temporary_obstacle_cell
+            ] = current_simulation_time
+
+
+    # =====================================================
+    # COMPLETED NAVIGATION CHECK
+    # =====================================================
+
+    if (
+        len(
+            navigation_waypoints
+        )
+        > 0
+        and
         current_waypoint_index
-        >= len(navigation_waypoints)
+        >=
+        len(
+            navigation_waypoints
+        )
     ):
 
         navigation_state = (
@@ -866,89 +1618,475 @@ while (
 
 
     # =====================================================
-    # REACTIVE OBSTACLE OVERRIDE
+    # NEW / UNKNOWN OBSTACLE DETECTED
     # =====================================================
     #
-    # IMPORTANT:
+    # Only an obstacle that is:
     #
-    # Only trigger reactive avoidance while the robot is
-    # actually driving.
+    # 1. not part of the static map
+    # 2. not already in the temporary map
     #
-    # Previously the sensors could detect a box while the
-    # robot was rotating toward a waypoint. That caused:
-    #
-    # TURN_TO_WAYPOINT
-    # -> AVOID
-    # -> TURN_TO_WAYPOINT
-    # -> AVOID
-    #
-    # and the robot could become trapped in a loop.
+    # begins the confirmation process.
     # =====================================================
 
-    if navigation_state == "DRIVE_TO_WAYPOINT":
+    if (
+        navigation_state
+        == "DRIVE_TO_WAYPOINT"
+        and
+        closest_obstacle_detection
+        is not None
+        and
+        not detection_is_known_static_obstacle
+        and
+        matching_temporary_obstacle_cell
+        is None
+    ):
+
+        left_wheel_motor.setVelocity(
+            0.0
+        )
+
+        right_wheel_motor.setVelocity(
+            0.0
+        )
+
+        obstacle_confirmation_start_time = (
+            current_simulation_time
+        )
+
+        navigation_state = (
+            "CONFIRM_OBSTACLE"
+        )
+
+        print()
+
+        print(
+            "Unexpected obstacle detected by",
+            closest_obstacle_detection[
+                "sensor_name"
+            ],
+            "sensor."
+        )
+
+        print(
+            "Estimated grid cell:",
+            detected_obstacle_grid_cell
+        )
+
+
+    # =====================================================
+    # CONFIRM OBSTACLE
+    # =====================================================
+
+    if (
+        navigation_state
+        == "CONFIRM_OBSTACLE"
+    ):
+
+        left_wheel_motor.setVelocity(
+            0.0
+        )
+
+        right_wheel_motor.setVelocity(
+            0.0
+        )
+
+
+        # Use the larger clear threshold while
+        # confirmation is in progress.
+        confirmation_obstacle_detection = (
+            find_closest_detected_obstacle(
+                front_obstacle_distance_value,
+                left_obstacle_distance_value,
+                right_obstacle_distance_value,
+                OBSTACLE_CLEAR_THRESHOLD
+            )
+        )
+
 
         # -------------------------------------------------
-        # OBSTACLE DIRECTLY AHEAD
+        # OBSTACLE DISAPPEARED
         # -------------------------------------------------
 
         if (
-            front_obstacle_distance_value
-            < OBSTACLE_DETECTION_THRESHOLD
+            confirmation_obstacle_detection
+            is None
         ):
 
-            obstacle_avoidance_start_yaw = (
-                robot_current_yaw
+            print(
+                "Obstacle cleared before confirmation."
             )
 
+            navigation_state = (
+                "TURN_TO_WAYPOINT"
+            )
+
+
+        else:
+
+            obstacle_visible_time = (
+                current_simulation_time
+                -
+                obstacle_confirmation_start_time
+            )
+
+
+            # ---------------------------------------------
+            # OBSTACLE CONFIRMED
+            # ---------------------------------------------
+
             if (
-                left_obstacle_distance_value
-                > right_obstacle_distance_value
+                obstacle_visible_time
+                >=
+                OBSTACLE_CONFIRMATION_TIME_SECONDS
+            ):
+
+                (
+                    estimated_obstacle_world_x,
+                    estimated_obstacle_world_y
+                ) = (
+                    estimate_obstacle_world_position(
+                        robot_world_x_position,
+                        robot_world_y_position,
+                        robot_current_yaw,
+                        confirmation_obstacle_detection
+                    )
+                )
+
+
+                detected_obstacle_grid_cell = (
+                    convert_world_position_to_grid_cell(
+                        estimated_obstacle_world_x,
+                        estimated_obstacle_world_y
+                    )
+                )
+
+
+                # -----------------------------------------
+                # CHECK WHETHER STATIC MAP ALREADY KNOWS IT
+                # -----------------------------------------
+
+                if (
+                    grid_cell_is_static_obstacle(
+                        detected_obstacle_grid_cell
+                    )
+                ):
+
+                    print(
+                        "Detected obstacle is already "
+                        "part of the static map."
+                    )
+
+                    navigation_state = (
+                        "TURN_TO_WAYPOINT"
+                    )
+
+
+                else:
+
+                    # -------------------------------------
+                    # CHECK WHETHER TEMPORARY MAP KNOWS IT
+                    # -------------------------------------
+
+                    matching_temporary_obstacle_cell = (
+                        find_matching_temporary_obstacle(
+                            detected_obstacle_grid_cell
+                        )
+                    )
+
+
+                    if (
+                        matching_temporary_obstacle_cell
+                        is not None
+                    ):
+
+                        temporary_obstacles[
+                            matching_temporary_obstacle_cell
+                        ] = (
+                            current_simulation_time
+                        )
+
+                        print(
+                            "Detected obstacle is already "
+                            "in temporary map:",
+                            matching_temporary_obstacle_cell
+                        )
+
+                        navigation_state = (
+                            "TURN_TO_WAYPOINT"
+                        )
+
+
+                    else:
+
+                        # ---------------------------------
+                        # GENUINELY NEW OBSTACLE
+                        # ---------------------------------
+
+                        stored_obstacle_grid_cell = (
+                            add_or_refresh_temporary_obstacle(
+                                detected_obstacle_grid_cell,
+                                current_simulation_time
+                            )
+                        )
+
+
+                        print()
+
+                        print(
+                            "=========================================="
+                        )
+
+                        print(
+                            "NEW TEMPORARY OBSTACLE ADDED"
+                        )
+
+                        print(
+                            "Sensor:",
+                            confirmation_obstacle_detection[
+                                "sensor_name"
+                            ]
+                        )
+
+                        print(
+                            "Estimated world position:",
+                            (
+                                round(
+                                    estimated_obstacle_world_x,
+                                    3
+                                ),
+                                round(
+                                    estimated_obstacle_world_y,
+                                    3
+                                )
+                            )
+                        )
+
+                        print(
+                            "Grid cell:",
+                            stored_obstacle_grid_cell
+                        )
+
+                        print(
+                            "Replanning route..."
+                        )
+
+                        print(
+                            "=========================================="
+                        )
+
+                        print()
+
+                        navigation_state = (
+                            "REPLAN"
+                        )
+
+
+    # =====================================================
+    # REPLAN A* PATH
+    # =====================================================
+
+    if navigation_state == "REPLAN":
+
+        left_wheel_motor.setVelocity(
+            0.0
+        )
+
+        right_wheel_motor.setVelocity(
+            0.0
+        )
+
+
+        current_robot_grid_cell = (
+            convert_world_position_to_grid_cell(
+                robot_world_x_position,
+                robot_world_y_position
+            )
+        )
+
+
+        current_occupancy_grid = (
+            build_current_occupancy_grid(
+                current_simulation_time
+            )
+        )
+
+
+        # The robot must always be able to
+        # start from its current grid cell.
+        current_occupancy_grid[
+            current_robot_grid_cell[0]
+        ][
+            current_robot_grid_cell[1]
+        ] = 0
+
+
+        replanned_grid_path = (
+            calculate_astar_path(
+                current_occupancy_grid,
+                current_robot_grid_cell,
+                goal_grid_cell
+            )
+        )
+
+
+        # -------------------------------------------------
+        # NO PATH CURRENTLY AVAILABLE
+        # -------------------------------------------------
+
+        if (
+            replanned_grid_path
+            is None
+        ):
+
+            print(
+                "No route currently available."
+            )
+
+            print(
+                "A.M.A.S.O.N. will wait "
+                "and try again."
+            )
+
+            navigation_waypoints = []
+
+            planned_grid_path = None
+
+            last_path_retry_time = (
+                current_simulation_time
+            )
+
+            navigation_state = (
+                "WAIT_FOR_PATH"
+            )
+
+
+        # -------------------------------------------------
+        # NEW PATH FOUND
+        # -------------------------------------------------
+
+        else:
+
+            planned_grid_path = (
+                replanned_grid_path
+            )
+
+            navigation_waypoints = (
+                create_navigation_waypoints(
+                    planned_grid_path
+                )
+            )
+
+            current_waypoint_index = 0
+
+
+            print()
+
+            print(
+                "=========================================="
+            )
+
+            print(
+                "NEW A* PATH FOUND"
+            )
+
+            print(
+                "Starting cell:",
+                current_robot_grid_cell
+            )
+
+            print(
+                "Grid cells:",
+                len(
+                    planned_grid_path
+                )
+            )
+
+            print(
+                "New waypoints:",
+                len(
+                    navigation_waypoints
+                )
+            )
+
+
+            for (
+                waypoint_number,
+                waypoint_world_position
+            ) in enumerate(
+                navigation_waypoints,
+                start=1
+            ):
+
+                print(
+                    f"Waypoint {waypoint_number}: "
+                    f"X={waypoint_world_position[0]:.3f}, "
+                    f"Y={waypoint_world_position[1]:.3f}"
+                )
+
+
+            print(
+                "=========================================="
+            )
+
+            print()
+
+
+            if (
+                len(
+                    navigation_waypoints
+                )
+                == 0
             ):
 
                 navigation_state = (
-                    "AVOID_LEFT"
+                    "GOAL_REACHED"
                 )
 
             else:
 
                 navigation_state = (
-                    "AVOID_RIGHT"
+                    "TURN_TO_WAYPOINT"
                 )
 
 
-        # -------------------------------------------------
-        # OBSTACLE ON LEFT
-        # -------------------------------------------------
+    # =====================================================
+    # WAIT FOR PATH
+    # =====================================================
 
-        elif (
-            left_obstacle_distance_value
-            < OBSTACLE_DETECTION_THRESHOLD
+    elif (
+        navigation_state
+        == "WAIT_FOR_PATH"
+    ):
+
+        left_wheel_motor.setVelocity(
+            0.0
+        )
+
+        right_wheel_motor.setVelocity(
+            0.0
+        )
+
+
+        time_since_last_retry = (
+            current_simulation_time
+            -
+            last_path_retry_time
+        )
+
+
+        if (
+            time_since_last_retry
+            >=
+            PATH_RETRY_INTERVAL_SECONDS
         ):
 
-            obstacle_avoidance_start_yaw = (
-                robot_current_yaw
+            last_path_retry_time = (
+                current_simulation_time
             )
 
             navigation_state = (
-                "AVOID_RIGHT"
-            )
-
-
-        # -------------------------------------------------
-        # OBSTACLE ON RIGHT
-        # -------------------------------------------------
-
-        elif (
-            right_obstacle_distance_value
-            < OBSTACLE_DETECTION_THRESHOLD
-        ):
-
-            obstacle_avoidance_start_yaw = (
-                robot_current_yaw
-            )
-
-            navigation_state = (
-                "AVOID_LEFT"
+                "REPLAN"
             )
 
 
@@ -956,7 +2094,10 @@ while (
     # TURN TOWARD WAYPOINT
     # =====================================================
 
-    if navigation_state == "TURN_TO_WAYPOINT":
+    elif (
+        navigation_state
+        == "TURN_TO_WAYPOINT"
+    ):
 
         (
             waypoint_target_x_position,
@@ -965,23 +2106,25 @@ while (
             current_waypoint_index
         ]
 
+
         distance_to_waypoint_x = (
             waypoint_target_x_position
-            - robot_world_x_position
+            -
+            robot_world_x_position
         )
 
         distance_to_waypoint_y = (
             waypoint_target_y_position
-            - robot_world_y_position
+            -
+            robot_world_y_position
         )
+
 
         straight_line_distance_to_waypoint = (
             math.sqrt(
-                distance_to_waypoint_x
-                * distance_to_waypoint_x
+                distance_to_waypoint_x ** 2
                 +
-                distance_to_waypoint_y
-                * distance_to_waypoint_y
+                distance_to_waypoint_y ** 2
             )
         )
 
@@ -992,14 +2135,19 @@ while (
 
         if (
             straight_line_distance_to_waypoint
-            <= WAYPOINT_DISTANCE_TOLERANCE
+            <=
+            WAYPOINT_DISTANCE_TOLERANCE
         ):
 
             current_waypoint_index += 1
 
+
             if (
                 current_waypoint_index
-                >= len(navigation_waypoints)
+                >=
+                len(
+                    navigation_waypoints
+                )
             ):
 
                 navigation_state = (
@@ -1022,10 +2170,12 @@ while (
                 )
             )
 
+
             waypoint_heading_error = (
                 normalize_angle_radians(
                     desired_waypoint_heading
-                    - robot_current_yaw
+                    -
+                    robot_current_yaw
                 )
             )
 
@@ -1035,8 +2185,11 @@ while (
             # ---------------------------------------------
 
             if (
-                abs(waypoint_heading_error)
-                <= WAYPOINT_HEADING_TOLERANCE
+                abs(
+                    waypoint_heading_error
+                )
+                <=
+                WAYPOINT_HEADING_TOLERANCE
             ):
 
                 left_wheel_motor.setVelocity(
@@ -1053,10 +2206,13 @@ while (
 
 
             # ---------------------------------------------
-            # TARGET IS LEFT
+            # TARGET IS TO LEFT
             # ---------------------------------------------
 
-            elif waypoint_heading_error > 0:
+            elif (
+                waypoint_heading_error
+                > 0
+            ):
 
                 left_wheel_motor.setVelocity(
                     -TURNING_WHEEL_SPEED
@@ -1068,7 +2224,7 @@ while (
 
 
             # ---------------------------------------------
-            # TARGET IS RIGHT
+            # TARGET IS TO RIGHT
             # ---------------------------------------------
 
             else:
@@ -1086,7 +2242,10 @@ while (
     # DRIVE TOWARD WAYPOINT
     # =====================================================
 
-    elif navigation_state == "DRIVE_TO_WAYPOINT":
+    elif (
+        navigation_state
+        == "DRIVE_TO_WAYPOINT"
+    ):
 
         (
             waypoint_target_x_position,
@@ -1095,25 +2254,28 @@ while (
             current_waypoint_index
         ]
 
+
         distance_to_waypoint_x = (
             waypoint_target_x_position
-            - robot_world_x_position
+            -
+            robot_world_x_position
         )
 
         distance_to_waypoint_y = (
             waypoint_target_y_position
-            - robot_world_y_position
+            -
+            robot_world_y_position
         )
+
 
         straight_line_distance_to_waypoint = (
             math.sqrt(
-                distance_to_waypoint_x
-                * distance_to_waypoint_x
+                distance_to_waypoint_x ** 2
                 +
-                distance_to_waypoint_y
-                * distance_to_waypoint_y
+                distance_to_waypoint_y ** 2
             )
         )
+
 
         desired_waypoint_heading = (
             math.atan2(
@@ -1122,10 +2284,12 @@ while (
             )
         )
 
+
         waypoint_heading_error = (
             normalize_angle_radians(
                 desired_waypoint_heading
-                - robot_current_yaw
+                -
+                robot_current_yaw
             )
         )
 
@@ -1136,10 +2300,12 @@ while (
 
         if (
             straight_line_distance_to_waypoint
-            <= WAYPOINT_DISTANCE_TOLERANCE
+            <=
+            WAYPOINT_DISTANCE_TOLERANCE
         ):
 
             current_waypoint_index += 1
+
 
             left_wheel_motor.setVelocity(
                 0.0
@@ -1149,9 +2315,13 @@ while (
                 0.0
             )
 
+
             if (
                 current_waypoint_index
-                >= len(navigation_waypoints)
+                >=
+                len(
+                    navigation_waypoints
+                )
             ):
 
                 navigation_state = (
@@ -1170,8 +2340,11 @@ while (
         # -------------------------------------------------
 
         elif (
-            abs(waypoint_heading_error)
-            > WAYPOINT_HEADING_TOLERANCE
+            abs(
+                waypoint_heading_error
+            )
+            >
+            WAYPOINT_HEADING_TOLERANCE
         ):
 
             left_wheel_motor.setVelocity(
@@ -1188,7 +2361,7 @@ while (
 
 
         # -------------------------------------------------
-        # CONTINUE DRIVING
+        # CONTINUE FORWARD
         # -------------------------------------------------
 
         else:
@@ -1203,88 +2376,13 @@ while (
 
 
     # =====================================================
-    # AVOID OBSTACLE BY TURNING LEFT
-    # =====================================================
-
-    elif navigation_state == "AVOID_LEFT":
-
-        left_wheel_motor.setVelocity(
-            -TURNING_WHEEL_SPEED
-        )
-
-        right_wheel_motor.setVelocity(
-            TURNING_WHEEL_SPEED
-        )
-
-        obstacle_avoidance_angle_turned = abs(
-            calculate_angle_difference(
-                robot_current_yaw,
-                obstacle_avoidance_start_yaw
-            )
-        )
-
-        if (
-            obstacle_avoidance_angle_turned
-            >= OBSTACLE_AVOIDANCE_TURN_ANGLE
-        ):
-
-            left_wheel_motor.setVelocity(
-                0.0
-            )
-
-            right_wheel_motor.setVelocity(
-                0.0
-            )
-
-            navigation_state = (
-                "TURN_TO_WAYPOINT"
-            )
-
-
-    # =====================================================
-    # AVOID OBSTACLE BY TURNING RIGHT
-    # =====================================================
-
-    elif navigation_state == "AVOID_RIGHT":
-
-        left_wheel_motor.setVelocity(
-            TURNING_WHEEL_SPEED
-        )
-
-        right_wheel_motor.setVelocity(
-            -TURNING_WHEEL_SPEED
-        )
-
-        obstacle_avoidance_angle_turned = abs(
-            calculate_angle_difference(
-                robot_current_yaw,
-                obstacle_avoidance_start_yaw
-            )
-        )
-
-        if (
-            obstacle_avoidance_angle_turned
-            >= OBSTACLE_AVOIDANCE_TURN_ANGLE
-        ):
-
-            left_wheel_motor.setVelocity(
-                0.0
-            )
-
-            right_wheel_motor.setVelocity(
-                0.0
-            )
-
-            navigation_state = (
-                "TURN_TO_WAYPOINT"
-            )
-
-
-    # =====================================================
     # GOAL REACHED
     # =====================================================
 
-    elif navigation_state == "GOAL_REACHED":
+    elif (
+        navigation_state
+        == "GOAL_REACHED"
+    ):
 
         left_wheel_motor.setVelocity(
             0.0
@@ -1296,10 +2394,13 @@ while (
 
 
     # =====================================================
-    # NO PATH
+    # STOPPED
     # =====================================================
 
-    elif navigation_state == "STOPPED":
+    elif (
+        navigation_state
+        == "STOPPED"
+    ):
 
         left_wheel_motor.setVelocity(
             0.0
@@ -1315,8 +2416,16 @@ while (
     # =====================================================
 
     if (
+        len(
+            navigation_waypoints
+        )
+        > 0
+        and
         current_waypoint_index
-        < len(navigation_waypoints)
+        <
+        len(
+            navigation_waypoints
+        )
     ):
 
         (
@@ -1326,15 +2435,18 @@ while (
             current_waypoint_index
         ]
 
+
         current_target_description = (
             f"Target=("
             f"{current_target_x_position:.2f},"
             f"{current_target_y_position:.2f})"
         )
 
+
         displayed_waypoint_number = (
             current_waypoint_index + 1
         )
+
 
     else:
 
@@ -1342,8 +2454,10 @@ while (
             "Target=GOAL"
         )
 
-        displayed_waypoint_number = len(
-            navigation_waypoints
+        displayed_waypoint_number = (
+            len(
+                navigation_waypoints
+            )
         )
 
 
@@ -1358,5 +2472,7 @@ while (
         f"{displayed_waypoint_number}/"
         f"{len(navigation_waypoints)}, "
         f"{current_target_description}, "
+        f"TemporaryObstacles="
+        f"{len(temporary_obstacles)}, "
         f"State={navigation_state}"
     )

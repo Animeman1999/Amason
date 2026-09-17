@@ -9,8 +9,8 @@ WorldInfo {
   title "A.M.A.S.O.N. Warehouse"
 }
 Viewpoint {
-  orientation 0.36371881081764257 0.7725867782189869 -0.5204020530115209 1.470753946135869
-  position -3.171541430512005 3.8787048028915727 12.081665944963833
+  orientation 0.014369802344497239 0.9995695677144208 -0.02557710069154986 1.0241177373050774
+  position -3.917740281279622 0.23655562083530923 7.681876508121726
 }
 TexturedBackground {
 }
@@ -26,7 +26,7 @@ Solid {
   children [
     Shape {
       appearance PBRAppearance {
-        baseColor 1 0 0
+        baseColor 0 1 0
         roughness 0.7
       }
       geometry Box {
@@ -44,7 +44,7 @@ Solid {
   children [
     Shape {
       appearance PBRAppearance {
-        baseColor 1 0 0
+        baseColor 0 1 0
         roughness 0.7
       }
       geometry Box {
@@ -53,6 +53,24 @@ Solid {
     }
   ]
   name "Box"
+  boundingObject Box {
+    size 0.2 0.4 0.3
+  }
+}
+Solid {
+  translation 1.4 -0.375 0.15
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 1 0 0
+        roughness 0.7
+      }
+      geometry Box {
+        size 0.2 0.4 0.3
+      }
+    }
+  ]
+  name "Temporary obstacle"
   boundingObject Box {
     size 0.2 0.4 0.3
   }
