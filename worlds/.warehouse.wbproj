@@ -5,5 +5,5 @@ sceneTreePerspectives: 000000ff00000001000000030000001e000000c0000000fa010000000
 maximizedDockId: -1
 centralWidgetVisible: 1
 orthographicViewHeight: 1
-textFiles: 1 "controllers/amason_controller/amason_controller.py" "controllers/amason_controller/visualize_amason_log.py"
+textFiles: 0 "controllers/amason_controller/amason_controller.py" "controllers/amason_controller/visualize_amason_log.py"
 consoles: Console:All:All

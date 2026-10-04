@@ -2,11 +2,15 @@
 
 Autonomous Mobile AI System for Optimized Navigation
 
-Adds to the previous controller:
+Current controller features:
 - autonomous patrol task execution
 - simplified A* waypoint paths
 - A* closed-set optimization
 - dynamic obstacle memory and replanning
+- simulated noisy GPS and distance-sensor measurements
+- grid-based Markov/Bayesian localization
+- occupancy-grid observation updates from movement and sensors
+- local reactive BACKTRACK / ESCAPE_TURN behavior
 - reduced-rate console output
 - CSV performance/data logging
 """
@@ -16,6 +20,7 @@ import csv
 import heapq
 import math
 import os
+import random
 
 
 # =========================================================
@@ -61,6 +66,43 @@ TEMPORARY_OBSTACLE_LIFETIME_SECONDS = 30.0
 TEMPORARY_OBSTACLE_INFLATION_CELLS = 1
 TEMPORARY_OBSTACLE_MATCH_RADIUS_CELLS = 1
 PATH_RETRY_INTERVAL_SECONDS = 1.0
+
+# ---------------------------------------------------------
+# LOCAL REACTIVE AVOIDANCE SETTINGS
+# ---------------------------------------------------------
+
+# If an obstacle is this close, immediately use a local
+# escape behavior instead of waiting for global replanning.
+EMERGENCY_OBSTACLE_THRESHOLD = 120
+BACKTRACK_WHEEL_SPEED = 1.5
+BACKTRACK_DURATION_SECONDS = 1.50
+ESCAPE_TURN_ANGLE_RADIANS = math.radians(45)
+NO_PATH_ATTEMPTS_BEFORE_BACKTRACK = 2
+
+# Wheel geometry used by the localization motion model.
+WHEEL_RADIUS_METERS = 0.075
+WHEEL_SEPARATION_METERS = 0.44
+
+# ---------------------------------------------------------
+# SIMULATED SENSOR NOISE / LOCALIZATION SETTINGS
+# ---------------------------------------------------------
+
+# A fixed seed makes demonstrations repeatable. Change this
+# number to obtain a different noise sequence.
+RANDOM_SEED = 42
+random.seed(RANDOM_SEED)
+
+GPS_NOISE_STANDARD_DEVIATION_METERS = 0.06
+DISTANCE_SENSOR_NOISE_STANDARD_DEVIATION = 8.0
+LOCALIZATION_GPS_LIKELIHOOD_STANDARD_DEVIATION_METERS = 0.18
+LOCALIZATION_INITIAL_STANDARD_DEVIATION_METERS = 0.20
+LOCALIZATION_UPDATE_INTERVAL_SECONDS = 0.10
+
+# The simulated distance sensors use the current lookup table
+# where approximately 1000 corresponds to one meter.
+DISTANCE_SENSOR_MINIMUM_VALUE = 0.0
+DISTANCE_SENSOR_MAXIMUM_VALUE = 1000.0
+MAPPING_OBSTACLE_SENSOR_THRESHOLD = 950.0
 
 
 # =========================================================
@@ -154,6 +196,407 @@ def create_empty_occupancy_grid():
 
 def copy_occupancy_grid(source_grid):
     return [grid_column.copy() for grid_column in source_grid]
+
+
+# =========================================================
+# SIMULATED NOISE FUNCTIONS
+# =========================================================
+
+def add_gaussian_noise(value, standard_deviation, minimum_value=None, maximum_value=None):
+    noisy_value = value + random.gauss(0.0, standard_deviation)
+
+    if minimum_value is not None:
+        noisy_value = max(minimum_value, noisy_value)
+
+    if maximum_value is not None:
+        noisy_value = min(maximum_value, noisy_value)
+
+    return noisy_value
+
+
+def create_noisy_gps_measurement(actual_world_x, actual_world_y):
+    noisy_world_x = add_gaussian_noise(
+        actual_world_x,
+        GPS_NOISE_STANDARD_DEVIATION_METERS,
+        ARENA_MINIMUM_COORDINATE,
+        ARENA_MINIMUM_COORDINATE + ARENA_SIZE_METERS,
+    )
+    noisy_world_y = add_gaussian_noise(
+        actual_world_y,
+        GPS_NOISE_STANDARD_DEVIATION_METERS,
+        ARENA_MINIMUM_COORDINATE,
+        ARENA_MINIMUM_COORDINATE + ARENA_SIZE_METERS,
+    )
+    return noisy_world_x, noisy_world_y
+
+
+def create_noisy_distance_sensor_measurement(actual_sensor_value):
+    return add_gaussian_noise(
+        actual_sensor_value,
+        DISTANCE_SENSOR_NOISE_STANDARD_DEVIATION,
+        DISTANCE_SENSOR_MINIMUM_VALUE,
+        DISTANCE_SENSOR_MAXIMUM_VALUE,
+    )
+
+
+# =========================================================
+# MARKOV / BAYESIAN LOCALIZATION FUNCTIONS
+# =========================================================
+
+def create_probability_grid():
+    return [
+        [0.0 for _ in range(GRID_CELL_COUNT)]
+        for _ in range(GRID_CELL_COUNT)
+    ]
+
+
+def normalize_probability_grid(probability_grid):
+    probability_total = sum(
+        probability_grid[grid_column][grid_row]
+        for grid_column in range(GRID_CELL_COUNT)
+        for grid_row in range(GRID_CELL_COUNT)
+    )
+
+    if probability_total <= 0.0:
+        return False
+
+    for grid_column in range(GRID_CELL_COUNT):
+        for grid_row in range(GRID_CELL_COUNT):
+            probability_grid[grid_column][grid_row] /= probability_total
+
+    return True
+
+
+def initialize_localization_probability_grid(initial_world_x, initial_world_y):
+    probability_grid = create_probability_grid()
+    variance = LOCALIZATION_INITIAL_STANDARD_DEVIATION_METERS ** 2
+
+    for grid_column in range(GRID_CELL_COUNT):
+        for grid_row in range(GRID_CELL_COUNT):
+            if localization_occupancy_grid[grid_column][grid_row] == 1:
+                continue
+
+            cell_world_x, cell_world_y = convert_grid_cell_to_world_position(
+                grid_column,
+                grid_row,
+            )
+            squared_distance = (
+                (cell_world_x - initial_world_x) ** 2
+                + (cell_world_y - initial_world_y) ** 2
+            )
+            probability_grid[grid_column][grid_row] = math.exp(
+                -squared_distance / (2.0 * variance)
+            )
+
+    normalize_probability_grid(probability_grid)
+    return probability_grid
+
+
+def determine_cardinal_motion_direction(robot_yaw, commanded_distance_meters):
+    movement_heading = robot_yaw
+    if commanded_distance_meters < 0.0:
+        movement_heading = normalize_angle_radians(robot_yaw + math.pi)
+
+    heading_x = math.cos(movement_heading)
+    heading_y = math.sin(movement_heading)
+
+    if abs(heading_x) >= abs(heading_y):
+        return (1, 0) if heading_x >= 0.0 else (-1, 0)
+
+    return (0, 1) if heading_y >= 0.0 else (0, -1)
+
+
+def apply_markov_motion_update(
+    probability_grid,
+    commanded_distance_meters,
+    robot_yaw,
+):
+    """Prediction step for grid-based Markov localization.
+
+    The belief is shifted probabilistically in the commanded
+    direction. Some probability remains in the current cell
+    or drifts laterally to represent wheel slip and motion error.
+    """
+
+    if abs(commanded_distance_meters) < 0.0001:
+        return probability_grid
+
+    predicted_probability_grid = create_probability_grid()
+    intended_column_offset, intended_row_offset = determine_cardinal_motion_direction(
+        robot_yaw,
+        commanded_distance_meters,
+    )
+
+    lateral_offsets = [
+        (-intended_row_offset, intended_column_offset),
+        (intended_row_offset, -intended_column_offset),
+    ]
+
+    cell_movement_fraction = min(
+        1.0,
+        abs(commanded_distance_meters) / GRID_CELL_SIZE_METERS,
+    )
+
+    intended_move_probability = 0.80 * cell_movement_fraction
+    lateral_move_probability = 0.05 * cell_movement_fraction
+    stay_probability = (
+        1.0
+        - intended_move_probability
+        - 2.0 * lateral_move_probability
+    )
+
+    def add_transition_probability(
+        source_probability,
+        source_column,
+        source_row,
+        column_offset,
+        row_offset,
+        transition_probability,
+    ):
+        destination_column = source_column + column_offset
+        destination_row = source_row + row_offset
+
+        if (
+            0 <= destination_column < GRID_CELL_COUNT
+            and 0 <= destination_row < GRID_CELL_COUNT
+            and localization_occupancy_grid[destination_column][destination_row] == 0
+        ):
+            predicted_probability_grid[destination_column][destination_row] += (
+                source_probability * transition_probability
+            )
+        else:
+            predicted_probability_grid[source_column][source_row] += (
+                source_probability * transition_probability
+            )
+
+    for grid_column in range(GRID_CELL_COUNT):
+        for grid_row in range(GRID_CELL_COUNT):
+            source_probability = probability_grid[grid_column][grid_row]
+            if source_probability <= 0.0:
+                continue
+
+            predicted_probability_grid[grid_column][grid_row] += (
+                source_probability * stay_probability
+            )
+
+            add_transition_probability(
+                source_probability,
+                grid_column,
+                grid_row,
+                intended_column_offset,
+                intended_row_offset,
+                intended_move_probability,
+            )
+
+            for lateral_column_offset, lateral_row_offset in lateral_offsets:
+                add_transition_probability(
+                    source_probability,
+                    grid_column,
+                    grid_row,
+                    lateral_column_offset,
+                    lateral_row_offset,
+                    lateral_move_probability,
+                )
+
+    normalize_probability_grid(predicted_probability_grid)
+    return predicted_probability_grid
+
+
+def apply_gps_measurement_update(
+    probability_grid,
+    noisy_gps_world_x,
+    noisy_gps_world_y,
+):
+    """Bayesian correction step using a noisy GPS measurement."""
+
+    corrected_probability_grid = create_probability_grid()
+    variance = LOCALIZATION_GPS_LIKELIHOOD_STANDARD_DEVIATION_METERS ** 2
+
+    for grid_column in range(GRID_CELL_COUNT):
+        for grid_row in range(GRID_CELL_COUNT):
+            if localization_occupancy_grid[grid_column][grid_row] == 1:
+                continue
+
+            cell_world_x, cell_world_y = convert_grid_cell_to_world_position(
+                grid_column,
+                grid_row,
+            )
+            squared_measurement_error = (
+                (cell_world_x - noisy_gps_world_x) ** 2
+                + (cell_world_y - noisy_gps_world_y) ** 2
+            )
+            measurement_likelihood = math.exp(
+                -squared_measurement_error / (2.0 * variance)
+            )
+
+            corrected_probability_grid[grid_column][grid_row] = (
+                probability_grid[grid_column][grid_row]
+                * max(measurement_likelihood, 1e-12)
+            )
+
+    if not normalize_probability_grid(corrected_probability_grid):
+        return initialize_localization_probability_grid(
+            noisy_gps_world_x,
+            noisy_gps_world_y,
+        )
+
+    return corrected_probability_grid
+
+
+def estimate_position_from_probability_grid(probability_grid):
+    estimated_world_x = 0.0
+    estimated_world_y = 0.0
+    most_likely_grid_cell = (0, 0)
+    highest_cell_probability = -1.0
+
+    for grid_column in range(GRID_CELL_COUNT):
+        for grid_row in range(GRID_CELL_COUNT):
+            cell_probability = probability_grid[grid_column][grid_row]
+            cell_world_x, cell_world_y = convert_grid_cell_to_world_position(
+                grid_column,
+                grid_row,
+            )
+
+            estimated_world_x += cell_probability * cell_world_x
+            estimated_world_y += cell_probability * cell_world_y
+
+            if cell_probability > highest_cell_probability:
+                highest_cell_probability = cell_probability
+                most_likely_grid_cell = (grid_column, grid_row)
+
+    return (
+        estimated_world_x,
+        estimated_world_y,
+        most_likely_grid_cell,
+        highest_cell_probability,
+    )
+
+
+# =========================================================
+# OBSERVED OCCUPANCY GRID FUNCTIONS
+# =========================================================
+
+def create_observed_occupancy_grid():
+    """Create an observation map: -1 unknown, 0 free, 1 occupied."""
+    return [
+        [-1 for _ in range(GRID_CELL_COUNT)]
+        for _ in range(GRID_CELL_COUNT)
+    ]
+
+
+def mark_robot_position_as_observed_free(
+    observed_grid,
+    robot_world_x_position,
+    robot_world_y_position,
+):
+    grid_column, grid_row = convert_world_position_to_grid_cell(
+        robot_world_x_position,
+        robot_world_y_position,
+    )
+
+    if localization_occupancy_grid[grid_column][grid_row] == 0:
+        observed_grid[grid_column][grid_row] = 0
+
+
+def calculate_sensor_world_geometry(
+    robot_world_x_position,
+    robot_world_y_position,
+    robot_current_yaw,
+    sensor_local_x,
+    sensor_local_y,
+    sensor_angle,
+):
+    sensor_world_x = (
+        robot_world_x_position
+        + sensor_local_x * math.cos(robot_current_yaw)
+        - sensor_local_y * math.sin(robot_current_yaw)
+    )
+    sensor_world_y = (
+        robot_world_y_position
+        + sensor_local_x * math.sin(robot_current_yaw)
+        + sensor_local_y * math.cos(robot_current_yaw)
+    )
+    sensor_world_heading = robot_current_yaw + sensor_angle
+    return sensor_world_x, sensor_world_y, sensor_world_heading
+
+
+def update_observed_map_from_sensor(
+    observed_grid,
+    robot_world_x_position,
+    robot_world_y_position,
+    robot_current_yaw,
+    sensor_local_x,
+    sensor_local_y,
+    sensor_angle,
+    noisy_sensor_value,
+):
+    """Update occupancy observations along one distance-sensor ray."""
+
+    sensor_world_x, sensor_world_y, sensor_world_heading = (
+        calculate_sensor_world_geometry(
+            robot_world_x_position,
+            robot_world_y_position,
+            robot_current_yaw,
+            sensor_local_x,
+            sensor_local_y,
+            sensor_angle,
+        )
+    )
+
+    measured_distance_meters = min(
+        1.0,
+        max(0.0, noisy_sensor_value / 1000.0),
+    )
+    ray_end_x = sensor_world_x + measured_distance_meters * math.cos(
+        sensor_world_heading
+    )
+    ray_end_y = sensor_world_y + measured_distance_meters * math.sin(
+        sensor_world_heading
+    )
+
+    ray_length = math.sqrt(
+        (ray_end_x - sensor_world_x) ** 2
+        + (ray_end_y - sensor_world_y) ** 2
+    )
+    number_of_samples = max(
+        1,
+        int(ray_length / (GRID_CELL_SIZE_METERS / 2.0)),
+    )
+
+    ray_grid_cells = []
+    for sample_index in range(number_of_samples + 1):
+        interpolation_fraction = sample_index / number_of_samples
+        sample_world_x = sensor_world_x + (
+            ray_end_x - sensor_world_x
+        ) * interpolation_fraction
+        sample_world_y = sensor_world_y + (
+            ray_end_y - sensor_world_y
+        ) * interpolation_fraction
+        sample_grid_cell = convert_world_position_to_grid_cell(
+            sample_world_x,
+            sample_world_y,
+        )
+        if not ray_grid_cells or ray_grid_cells[-1] != sample_grid_cell:
+            ray_grid_cells.append(sample_grid_cell)
+
+    obstacle_detected = noisy_sensor_value < MAPPING_OBSTACLE_SENSOR_THRESHOLD
+
+    for ray_index, (grid_column, grid_row) in enumerate(ray_grid_cells):
+        is_last_cell = ray_index == len(ray_grid_cells) - 1
+
+        if is_last_cell and obstacle_detected:
+            observed_grid[grid_column][grid_row] = 1
+        elif localization_occupancy_grid[grid_column][grid_row] == 0:
+            observed_grid[grid_column][grid_row] = 0
+
+
+def count_observed_map_cells(observed_grid):
+    return sum(
+        1
+        for grid_column in range(GRID_CELL_COUNT)
+        for grid_row in range(GRID_CELL_COUNT)
+        if observed_grid[grid_column][grid_row] != -1
+    )
 
 
 # =========================================================
@@ -494,17 +937,16 @@ def estimate_obstacle_world_position(
         obstacle_detection["sensor_value"]
     )
 
-    sensor_world_x = (
-        robot_world_x_position
-        + sensor_local_x * math.cos(robot_current_yaw)
-        - sensor_local_y * math.sin(robot_current_yaw)
+    sensor_world_x, sensor_world_y, sensor_world_heading = (
+        calculate_sensor_world_geometry(
+            robot_world_x_position,
+            robot_world_y_position,
+            robot_current_yaw,
+            sensor_local_x,
+            sensor_local_y,
+            obstacle_detection["sensor_angle"],
+        )
     )
-    sensor_world_y = (
-        robot_world_y_position
-        + sensor_local_x * math.sin(robot_current_yaw)
-        + sensor_local_y * math.cos(robot_current_yaw)
-    )
-    sensor_world_heading = robot_current_yaw + obstacle_detection["sensor_angle"]
 
     estimated_obstacle_world_x = (
         sensor_world_x + obstacle_distance_meters * math.cos(sensor_world_heading)
@@ -540,6 +982,43 @@ mark_rectangular_obstacle_on_grid(
     STATIC_OBSTACLE_SAFETY_MARGIN,
 )
 
+# Localization uses physical obstacle footprints rather than
+# the larger planning safety margins.
+localization_occupancy_grid = create_empty_occupancy_grid()
+mark_rectangular_obstacle_on_grid(
+    localization_occupancy_grid,
+    BOX_ONE_CENTER_X,
+    BOX_ONE_CENTER_Y,
+    BOX_ONE_SIZE_X,
+    BOX_ONE_SIZE_Y,
+    0.0,
+)
+mark_rectangular_obstacle_on_grid(
+    localization_occupancy_grid,
+    BOX_TWO_CENTER_X,
+    BOX_TWO_CENTER_Y,
+    BOX_TWO_SIZE_X,
+    BOX_TWO_SIZE_Y,
+    0.0,
+)
+
+observed_occupancy_grid = create_observed_occupancy_grid()
+for initialization_grid_column in range(GRID_CELL_COUNT):
+    for initialization_grid_row in range(GRID_CELL_COUNT):
+        if localization_occupancy_grid[initialization_grid_column][initialization_grid_row] == 1:
+            observed_occupancy_grid[initialization_grid_column][initialization_grid_row] = 1
+
+localization_probability_grid = initialize_localization_probability_grid(
+    ROBOT_START_WORLD_POSITION[0],
+    ROBOT_START_WORLD_POSITION[1],
+)
+(
+    localized_robot_world_x_position,
+    localized_robot_world_y_position,
+    localized_robot_grid_cell,
+    localization_confidence,
+) = estimate_position_from_probability_grid(localization_probability_grid)
+
 
 # =========================================================
 # PERFORMANCE COUNTERS AND PATROL INITIALIZATION
@@ -549,8 +1028,18 @@ path_plan_count = 0
 dynamic_replan_count = 0
 heading_correction_count = 0
 patrol_points_reached_count = 0
+backtrack_count = 0
+escape_turn_count = 0
 total_distance_traveled_meters = 0.0
-previous_robot_world_position = None
+previous_actual_robot_world_position = None
+
+consecutive_no_path_count = 0
+backtrack_start_time = 0.0
+backtrack_reason = ""
+escape_turn_target_yaw = 0.0
+previous_control_loop_time = amason_robot.getTime()
+last_localization_update_time = amason_robot.getTime()
+commanded_linear_distance_since_localization_update = 0.0
 
 current_patrol_location_index = 0
 current_patrol_goal_world_position = PATROL_LOCATIONS[current_patrol_location_index]
@@ -606,6 +1095,18 @@ navigation_log_writer.writerow(
         "Event",
         "EventX",
         "EventY",
+        "ActualX",
+        "ActualY",
+        "NoisyGpsX",
+        "NoisyGpsY",
+        "LocalizedX",
+        "LocalizedY",
+        "LocalizedGridColumn",
+        "LocalizedGridRow",
+        "LocalizationConfidence",
+        "ObservedMapCellCount",
+        "BacktrackCount",
+        "EscapeTurnCount",
     ]
 )
 
@@ -636,6 +1137,10 @@ else:
     print("Navigation waypoints:", len(navigation_waypoints))
 
 print("CSV log:", LOG_FILE_PATH)
+print("Localization: Markov prediction + Bayesian noisy-GPS correction")
+print("GPS noise sigma:", GPS_NOISE_STANDARD_DEVIATION_METERS, "meters")
+print("Distance sensor noise sigma:", DISTANCE_SENSOR_NOISE_STANDARD_DEVIATION)
+print("Local escape behavior: BACKTRACK -> ESCAPE_TURN -> PLAN_ROUTE")
 print("==========================================")
 print()
 
@@ -646,28 +1151,152 @@ print()
 
 while amason_robot.step(SIMULATION_TIME_STEP) != -1:
     current_simulation_time = amason_robot.getTime()
+    control_loop_delta_time = max(
+        0.0,
+        current_simulation_time - previous_control_loop_time,
+    )
+    previous_control_loop_time = current_simulation_time
 
-    current_gps_position = gps_sensor.getValues()
-    robot_world_x_position = current_gps_position[0]
-    robot_world_y_position = current_gps_position[1]
+    # -----------------------------------------------------
+    # SIMULATOR GROUND TRUTH
+    # -----------------------------------------------------
+    # Ground-truth GPS is retained for evaluation/logging.
+    # Navigation and mapping use the Markov-localized position.
 
-    if previous_robot_world_position is not None:
-        movement_delta_x = robot_world_x_position - previous_robot_world_position[0]
-        movement_delta_y = robot_world_y_position - previous_robot_world_position[1]
+    current_actual_gps_position = gps_sensor.getValues()
+    actual_robot_world_x_position = current_actual_gps_position[0]
+    actual_robot_world_y_position = current_actual_gps_position[1]
+
+    if previous_actual_robot_world_position is not None:
+        movement_delta_x = (
+            actual_robot_world_x_position
+            - previous_actual_robot_world_position[0]
+        )
+        movement_delta_y = (
+            actual_robot_world_y_position
+            - previous_actual_robot_world_position[1]
+        )
         total_distance_traveled_meters += math.sqrt(
             movement_delta_x ** 2 + movement_delta_y ** 2
         )
 
-    previous_robot_world_position = (
-        robot_world_x_position,
-        robot_world_y_position,
+    previous_actual_robot_world_position = (
+        actual_robot_world_x_position,
+        actual_robot_world_y_position,
     )
 
     robot_current_yaw = inertial_orientation_sensor.getRollPitchYaw()[2]
 
-    front_obstacle_distance_value = front_distance_sensor.getValue()
-    left_obstacle_distance_value = left_front_distance_sensor.getValue()
-    right_obstacle_distance_value = right_front_distance_sensor.getValue()
+    # -----------------------------------------------------
+    # SIMULATED NOISY SENSOR DATA
+    # -----------------------------------------------------
+
+    noisy_gps_world_x, noisy_gps_world_y = create_noisy_gps_measurement(
+        actual_robot_world_x_position,
+        actual_robot_world_y_position,
+    )
+
+    actual_front_sensor_value = front_distance_sensor.getValue()
+    actual_left_sensor_value = left_front_distance_sensor.getValue()
+    actual_right_sensor_value = right_front_distance_sensor.getValue()
+
+    front_obstacle_distance_value = create_noisy_distance_sensor_measurement(
+        actual_front_sensor_value
+    )
+    left_obstacle_distance_value = create_noisy_distance_sensor_measurement(
+        actual_left_sensor_value
+    )
+    right_obstacle_distance_value = create_noisy_distance_sensor_measurement(
+        actual_right_sensor_value
+    )
+
+    # -----------------------------------------------------
+    # MARKOV LOCALIZATION MOTION PREDICTION
+    # -----------------------------------------------------
+
+    commanded_left_wheel_speed = left_wheel_motor.getVelocity()
+    commanded_right_wheel_speed = right_wheel_motor.getVelocity()
+    commanded_linear_velocity = (
+        WHEEL_RADIUS_METERS
+        * (commanded_left_wheel_speed + commanded_right_wheel_speed)
+        / 2.0
+    )
+    commanded_linear_distance_since_localization_update += (
+        commanded_linear_velocity * control_loop_delta_time
+    )
+
+    if (
+        current_simulation_time - last_localization_update_time
+        >= LOCALIZATION_UPDATE_INTERVAL_SECONDS
+    ):
+        localization_probability_grid = apply_markov_motion_update(
+            localization_probability_grid,
+            commanded_linear_distance_since_localization_update,
+            robot_current_yaw,
+        )
+        localization_probability_grid = apply_gps_measurement_update(
+            localization_probability_grid,
+            noisy_gps_world_x,
+            noisy_gps_world_y,
+        )
+        (
+            localized_robot_world_x_position,
+            localized_robot_world_y_position,
+            localized_robot_grid_cell,
+            localization_confidence,
+        ) = estimate_position_from_probability_grid(
+            localization_probability_grid
+        )
+
+        commanded_linear_distance_since_localization_update = 0.0
+        last_localization_update_time = current_simulation_time
+
+    # The controller uses the probabilistic localization estimate.
+    robot_world_x_position = localized_robot_world_x_position
+    robot_world_y_position = localized_robot_world_y_position
+
+    # -----------------------------------------------------
+    # OCCUPANCY-MAP OBSERVATION UPDATE
+    # -----------------------------------------------------
+
+    mark_robot_position_as_observed_free(
+        observed_occupancy_grid,
+        robot_world_x_position,
+        robot_world_y_position,
+    )
+
+    update_observed_map_from_sensor(
+        observed_occupancy_grid,
+        robot_world_x_position,
+        robot_world_y_position,
+        robot_current_yaw,
+        FRONT_SENSOR_LOCAL_X,
+        FRONT_SENSOR_LOCAL_Y,
+        FRONT_SENSOR_ANGLE,
+        front_obstacle_distance_value,
+    )
+    update_observed_map_from_sensor(
+        observed_occupancy_grid,
+        robot_world_x_position,
+        robot_world_y_position,
+        robot_current_yaw,
+        LEFT_SENSOR_LOCAL_X,
+        LEFT_SENSOR_LOCAL_Y,
+        LEFT_SENSOR_ANGLE,
+        left_obstacle_distance_value,
+    )
+    update_observed_map_from_sensor(
+        observed_occupancy_grid,
+        robot_world_x_position,
+        robot_world_y_position,
+        robot_current_yaw,
+        RIGHT_SENSOR_LOCAL_X,
+        RIGHT_SENSOR_LOCAL_Y,
+        RIGHT_SENSOR_ANGLE,
+        right_obstacle_distance_value,
+    )
+
+    remove_expired_temporary_obstacles(current_simulation_time)
 
     # -----------------------------------------------------
     # Detect and classify the closest obstacle.
@@ -709,7 +1338,36 @@ while amason_robot.step(SIMULATION_TIME_STEP) != -1:
         if matching_temporary_obstacle_cell is not None:
             temporary_obstacles[matching_temporary_obstacle_cell] = current_simulation_time
 
-    # Only a genuinely new obstacle interrupts forward motion.
+    # -----------------------------------------------------
+    # EMERGENCY LOCAL REACTIVE AVOIDANCE
+    # -----------------------------------------------------
+    # This is deliberately independent of A*. If the robot
+    # gets very close to an object, it backs away first and
+    # then turns toward the clearer side before replanning.
+
+    closest_sensor_value = min(
+        front_obstacle_distance_value,
+        left_obstacle_distance_value,
+        right_obstacle_distance_value,
+    )
+
+    if (
+        navigation_state == "DRIVE_TO_WAYPOINT"
+        and closest_sensor_value < EMERGENCY_OBSTACLE_THRESHOLD
+    ):
+        left_wheel_motor.setVelocity(0.0)
+        right_wheel_motor.setVelocity(0.0)
+        backtrack_start_time = current_simulation_time
+        backtrack_reason = "EMERGENCY_OBSTACLE"
+        backtrack_count += 1
+        navigation_state = "BACKTRACK"
+        pending_log_events.append("BACKTRACK_STARTED")
+        print(
+            "Emergency obstacle range detected. "
+            "Starting local BACKTRACK behavior."
+        )
+
+    # Only a genuinely new obstacle interrupts ordinary forward motion.
     if (
         navigation_state == "DRIVE_TO_WAYPOINT"
         and closest_obstacle_detection is not None
@@ -830,11 +1488,25 @@ while amason_robot.step(SIMULATION_TIME_STEP) != -1:
         current_waypoint_index = 0
 
         if raw_grid_path is None or not navigation_waypoints:
-            last_path_retry_time = current_simulation_time
-            navigation_state = "WAIT_FOR_PATH"
+            consecutive_no_path_count += 1
             pending_log_events.append("NO_PATH")
-            print("No route currently available. A.M.A.S.O.N. will retry.")
+
+            if consecutive_no_path_count >= NO_PATH_ATTEMPTS_BEFORE_BACKTRACK:
+                backtrack_start_time = current_simulation_time
+                backtrack_reason = "NO_PATH"
+                backtrack_count += 1
+                navigation_state = "BACKTRACK"
+                pending_log_events.append("BACKTRACK_STARTED")
+                print(
+                    "No route after repeated A* attempts. "
+                    "Starting local BACKTRACK behavior."
+                )
+            else:
+                last_path_retry_time = current_simulation_time
+                navigation_state = "WAIT_FOR_PATH"
+                print("No route currently available. A.M.A.S.O.N. will retry.")
         else:
+            consecutive_no_path_count = 0
             navigation_state = "TURN_TO_WAYPOINT"
             pending_log_events.append("PATH_PLANNED")
 
@@ -850,6 +1522,7 @@ while amason_robot.step(SIMULATION_TIME_STEP) != -1:
             print("Raw A* cells:", len(raw_grid_path))
             print("Simplified cells:", len(planned_grid_path))
             print("Navigation waypoints:", len(navigation_waypoints))
+            print("Localized start cell:", starting_grid_cell)
             print("==========================================")
             print()
 
@@ -864,6 +1537,54 @@ while amason_robot.step(SIMULATION_TIME_STEP) != -1:
             last_path_retry_time = current_simulation_time
             planning_reason = "PATH_RETRY"
             navigation_state = "PLAN_ROUTE"
+
+    elif navigation_state == "BACKTRACK":
+        # Move backward briefly to create maneuvering room.
+        left_wheel_motor.setVelocity(-BACKTRACK_WHEEL_SPEED)
+        right_wheel_motor.setVelocity(-BACKTRACK_WHEEL_SPEED)
+
+        if (
+            current_simulation_time - backtrack_start_time
+            >= BACKTRACK_DURATION_SECONDS
+        ):
+            left_wheel_motor.setVelocity(0.0)
+            right_wheel_motor.setVelocity(0.0)
+
+            # Higher sensor values mean more open space.
+            if left_obstacle_distance_value >= right_obstacle_distance_value:
+                escape_turn_target_yaw = normalize_angle_radians(
+                    robot_current_yaw + ESCAPE_TURN_ANGLE_RADIANS
+                )
+            else:
+                escape_turn_target_yaw = normalize_angle_radians(
+                    robot_current_yaw - ESCAPE_TURN_ANGLE_RADIANS
+                )
+
+            escape_turn_count += 1
+            navigation_state = "ESCAPE_TURN"
+            pending_log_events.append("BACKTRACK_COMPLETE")
+            print(
+                "Backtrack complete. Turning toward clearer side before replanning."
+            )
+
+    elif navigation_state == "ESCAPE_TURN":
+        escape_heading_error = normalize_angle_radians(
+            escape_turn_target_yaw - robot_current_yaw
+        )
+
+        if abs(escape_heading_error) <= WAYPOINT_HEADING_TOLERANCE:
+            left_wheel_motor.setVelocity(0.0)
+            right_wheel_motor.setVelocity(0.0)
+            planning_reason = "LOCAL_ESCAPE"
+            navigation_state = "PLAN_ROUTE"
+            pending_log_events.append("ESCAPE_TURN_COMPLETE")
+            print("Local escape turn complete. Replanning route.")
+        elif escape_heading_error > 0.0:
+            left_wheel_motor.setVelocity(-TURNING_WHEEL_SPEED)
+            right_wheel_motor.setVelocity(TURNING_WHEEL_SPEED)
+        else:
+            left_wheel_motor.setVelocity(TURNING_WHEEL_SPEED)
+            right_wheel_motor.setVelocity(-TURNING_WHEEL_SPEED)
 
     elif navigation_state == "TURN_TO_WAYPOINT":
         if current_waypoint_index >= len(navigation_waypoints):
@@ -987,11 +1708,15 @@ while amason_robot.step(SIMULATION_TIME_STEP) != -1:
         else:
             displayed_waypoint_number = len(navigation_waypoints)
 
+        observed_map_cell_count = count_observed_map_cells(
+            observed_occupancy_grid
+        )
+
         navigation_log_writer.writerow(
             [
                 round(current_simulation_time, 3),
-                robot_world_x_position,
-                robot_world_y_position,
+                actual_robot_world_x_position,
+                actual_robot_world_y_position,
                 robot_current_yaw,
                 left_obstacle_distance_value,
                 front_obstacle_distance_value,
@@ -1011,6 +1736,18 @@ while amason_robot.step(SIMULATION_TIME_STEP) != -1:
                 "|".join(pending_log_events),
                 pending_event_world_x,
                 pending_event_world_y,
+                actual_robot_world_x_position,
+                actual_robot_world_y_position,
+                noisy_gps_world_x,
+                noisy_gps_world_y,
+                localized_robot_world_x_position,
+                localized_robot_world_y_position,
+                localized_robot_grid_cell[0],
+                localized_robot_grid_cell[1],
+                localization_confidence,
+                observed_map_cell_count,
+                backtrack_count,
+                escape_turn_count,
             ]
         )
 
@@ -1043,15 +1780,26 @@ while amason_robot.step(SIMULATION_TIME_STEP) != -1:
                 f"{len(navigation_waypoints)}/{len(navigation_waypoints)}"
             )
 
+        observed_map_cell_count = count_observed_map_cells(
+            observed_occupancy_grid
+        )
+
         print(
-            f"X={robot_world_x_position:.3f}, "
-            f"Y={robot_world_y_position:.3f}, "
+            f"Actual=({actual_robot_world_x_position:.3f},"
+            f"{actual_robot_world_y_position:.3f}), "
+            f"NoisyGPS=({noisy_gps_world_x:.3f},{noisy_gps_world_y:.3f}), "
+            f"Localized=({localized_robot_world_x_position:.3f},"
+            f"{localized_robot_world_y_position:.3f}), "
+            f"LocCell={localized_robot_grid_cell}, "
+            f"LocConf={localization_confidence:.3f}, "
             f"Yaw={robot_current_yaw:.3f}, "
             f"Patrol={current_patrol_location_index + 1}/{len(PATROL_LOCATIONS)}, "
             f"Waypoint={waypoint_description}, "
             f"Target={current_target_description}, "
+            f"ObservedCells={observed_map_cell_count}, "
             f"TempObstacles={len(temporary_obstacles)}, "
             f"Replans={dynamic_replan_count}, "
+            f"Backtracks={backtrack_count}, "
             f"Distance={total_distance_traveled_meters:.2f}m, "
             f"State={navigation_state}"
         )
