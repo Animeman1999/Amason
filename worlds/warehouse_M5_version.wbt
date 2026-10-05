@@ -9,8 +9,8 @@ WorldInfo {
   title "A.M.A.S.O.N. Warehouse"
 }
 Viewpoint {
-  orientation 0.0031249519637041047 0.999981373228472 -0.005242887689388229 1.0750163841500162
-  position -4.5116230047516765 -0.23062034974454937 8.025104315112541
+  orientation 0.014369802344497239 0.9995695677144208 -0.02557710069154986 1.0241177373050774
+  position -3.917740281279622 0.23655562083530923 7.681876508121726
 }
 TexturedBackground {
 }
@@ -19,24 +19,6 @@ TexturedBackgroundLight {
 RectangleArena {
   floorSize 5 5
   floorAppearance Parquetry {
-  }
-}
-Solid {
-  translation 1.2 0.4 0.15
-  children [
-    Shape {
-      appearance PBRAppearance {
-        baseColor 0 1 0
-        roughness 0.7
-      }
-      geometry Box {
-        size 0.2 0.4 0.3
-      }
-    }
-  ]
-  name "Known Obstacle 1"
-  boundingObject Box {
-    size 0.2 0.4 0.3
   }
 }
 Solid {
@@ -52,13 +34,13 @@ Solid {
       }
     }
   ]
-  name "Known Obstacle 2"
+  name "Box2"
   boundingObject Box {
     size 0.2 0.4 0.3
   }
 }
 Solid {
-  translation -1.2 -1.2 0.15
+  translation 1.2 0.4 0.15
   children [
     Shape {
       appearance PBRAppearance {
@@ -66,179 +48,17 @@ Solid {
         roughness 0.7
       }
       geometry Box {
-        size 0.22 0.22 0.3
+        size 0.2 0.4 0.3
       }
     }
   ]
-  name "Known Obstacle 3"
+  name "Box"
   boundingObject Box {
-    size 0.22 0.22 0.3
+    size 0.2 0.4 0.3
   }
 }
 Solid {
-  translation 0 -1.25 0.15
-  children [
-    Shape {
-      appearance PBRAppearance {
-        baseColor 0 1 0
-        roughness 0.7
-      }
-      geometry Box {
-        size 0.22 0.22 0.3
-      }
-    }
-  ]
-  name "Known Obstacle 4"
-  boundingObject Box {
-    size 0.22 0.22 0.3
-  }
-}
-Solid {
-  translation 1.2 -1.1 0.15
-  children [
-    Shape {
-      appearance PBRAppearance {
-        baseColor 0 1 0
-        roughness 0.7
-      }
-      geometry Box {
-        size 0.22 0.22 0.3
-      }
-    }
-  ]
-  name "Known Obstacle 5"
-  boundingObject Box {
-    size 0.22 0.22 0.3
-  }
-}
-Solid {
-  translation -1.65 -0.1 0.15
-  children [
-    Shape {
-      appearance PBRAppearance {
-        baseColor 0 1 0
-        roughness 0.7
-      }
-      geometry Box {
-        size 0.22 0.22 0.3
-      }
-    }
-  ]
-  name "Known Obstacle 6"
-  boundingObject Box {
-    size 0.22 0.22 0.3
-  }
-}
-Solid {
-  translation -0.45 -0.05 0.15
-  children [
-    Shape {
-      appearance PBRAppearance {
-        baseColor 0 1 0
-        roughness 0.7
-      }
-      geometry Box {
-        size 0.22 0.22 0.3
-      }
-    }
-  ]
-  name "Known Obstacle 7"
-  boundingObject Box {
-    size 0.22 0.22 0.3
-  }
-}
-Solid {
-  translation -1.15 1.1 0.15
-  children [
-    Shape {
-      appearance PBRAppearance {
-        baseColor 0 1 0
-        roughness 0.7
-      }
-      geometry Box {
-        size 0.22 0.22 0.3
-      }
-    }
-  ]
-  name "Known Obstacle 8"
-  boundingObject Box {
-    size 0.22 0.22 0.3
-  }
-}
-Solid {
-  translation 0.1 1.7 0.15
-  children [
-    Shape {
-      appearance PBRAppearance {
-        baseColor 0 1 0
-        roughness 0.7
-      }
-      geometry Box {
-        size 0.22 0.22 0.3
-      }
-    }
-  ]
-  name "Known Obstacle 9"
-  boundingObject Box {
-    size 0.22 0.22 0.3
-  }
-}
-Solid {
-  translation 1.55 1.5 0.15
-  children [
-    Shape {
-      appearance PBRAppearance {
-        baseColor 0 1 0
-        roughness 0.7
-      }
-      geometry Box {
-        size 0.22 0.22 0.3
-      }
-    }
-  ]
-  name "Known Obstacle 10"
-  boundingObject Box {
-    size 0.22 0.22 0.3
-  }
-}
-Solid {
-  translation -0.45 0.85 0.15
-  children [
-    Shape {
-      appearance PBRAppearance {
-        baseColor 0 1 0
-        roughness 0.7
-      }
-      geometry Box {
-        size 0.22 0.22 0.3
-      }
-    }
-  ]
-  name "Known Obstacle 11"
-  boundingObject Box {
-    size 0.22 0.22 0.3
-  }
-}
-Solid {
-  translation -1.65 1.65 0.15
-  children [
-    Shape {
-      appearance PBRAppearance {
-        baseColor 0 1 0
-        roughness 0.7
-      }
-      geometry Box {
-        size 0.22 0.22 0.3
-      }
-    }
-  ]
-  name "Known Obstacle 12"
-  boundingObject Box {
-    size 0.22 0.22 0.3
-  }
-}
-Solid {
-  translation -0.85 -0.625 0.15
+  translation 1.4 -0.375 0.15
   children [
     Shape {
       appearance PBRAppearance {
@@ -246,53 +66,17 @@ Solid {
         roughness 0.7
       }
       geometry Box {
-        size 0.25 0.25 0.3
+        size 0.2 0.4 0.3
       }
     }
   ]
-  name "Temporary Obstacle 1"
+  name "Temporary obstacle"
   boundingObject Box {
-    size 0.25 0.25 0.3
-  }
-}
-Solid {
-  translation 1.375 -0.375 0.15
-  children [
-    Shape {
-      appearance PBRAppearance {
-        baseColor 1 0 0
-        roughness 0.7
-      }
-      geometry Box {
-        size 0.25 0.25 0.3
-      }
-    }
-  ]
-  name "Temporary Obstacle 2"
-  boundingObject Box {
-    size 0.25 0.25 0.3
-  }
-}
-Solid {
-  translation 0.875 2 0.15
-  children [
-    Shape {
-      appearance PBRAppearance {
-        baseColor 1 0 0
-        roughness 0.7
-      }
-      geometry Box {
-        size 0.25 0.25 0.3
-      }
-    }
-  ]
-  name "Temporary Obstacle 3"
-  boundingObject Box {
-    size 0.25 0.25 0.3
+    size 0.2 0.4 0.3
   }
 }
 Robot {
-  translation -2 -2 0.1
+  translation 0 0 0.1
   children [
     DistanceSensor {
       translation 0.245 -0.15 0
@@ -434,7 +218,6 @@ Robot {
     size 0.5 0.4 0.12
   }
   physics Physics {
-    density -1
     mass 8
   }
   controller "amason_controller"

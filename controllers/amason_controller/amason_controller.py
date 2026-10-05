@@ -3,14 +3,15 @@
 Autonomous Mobile AI System for Optimized Navigation
 
 Current controller features:
-- autonomous patrol task execution
+- corner-to-corner goal navigation (patrol logic retained but disabled)
 - simplified A* waypoint paths
 - A* closed-set optimization
 - dynamic obstacle memory and replanning
 - simulated noisy GPS and distance-sensor measurements
 - grid-based Markov/Bayesian localization
 - occupancy-grid observation updates from movement and sensors
-- local reactive BACKTRACK / ESCAPE_TURN behavior
+- local reactive BACKTRACK / ESCAPE_TURN / ESCAPE_DRIVE behavior
+- no-progress stuck detection with automatic recovery
 - reduced-rate console output
 - CSV performance/data logging
 """
@@ -62,10 +63,18 @@ WAYPOINT_DISTANCE_TOLERANCE = 0.10
 OBSTACLE_DETECTION_THRESHOLD = 300
 OBSTACLE_CLEAR_THRESHOLD = 350
 OBSTACLE_CONFIRMATION_TIME_SECONDS = 0.50
-TEMPORARY_OBSTACLE_LIFETIME_SECONDS = 30.0
+TEMPORARY_OBSTACLE_LIFETIME_SECONDS = 120.0
 TEMPORARY_OBSTACLE_INFLATION_CELLS = 1
-TEMPORARY_OBSTACLE_MATCH_RADIUS_CELLS = 1
+TEMPORARY_OBSTACLE_MATCH_RADIUS_CELLS = 2
 PATH_RETRY_INTERVAL_SECONDS = 1.0
+
+# Temporary obstacles stay in memory long enough to prevent the robot
+# from forgetting an object while it is still navigating around it.
+
+# The outermost grid cells represent the arena walls. Blocking
+# them prevents A* from routing the robot along the physical walls
+# and prevents wall detections from being stored as temporary objects.
+ARENA_BOUNDARY_BLOCKED_CELLS = 1
 
 # ---------------------------------------------------------
 # LOCAL REACTIVE AVOIDANCE SETTINGS
@@ -77,7 +86,28 @@ EMERGENCY_OBSTACLE_THRESHOLD = 120
 BACKTRACK_WHEEL_SPEED = 1.5
 BACKTRACK_DURATION_SECONDS = 1.50
 ESCAPE_TURN_ANGLE_RADIANS = math.radians(45)
+ESCAPE_DRIVE_WHEEL_SPEED = 1.5
+ESCAPE_DRIVE_DURATION_SECONDS = 2.0
+LOCAL_ESCAPE_COOLDOWN_SECONDS = 2.0
 NO_PATH_ATTEMPTS_BEFORE_BACKTRACK = 2
+
+# ---------------------------------------------------------
+# STUCK / NO-PROGRESS DETECTION
+# ---------------------------------------------------------
+# A robot can be physically blocked even when none of the distance
+# sensors reports a value below the emergency threshold. This can
+# happen if the chassis catches the corner/side of an obstacle.
+#
+# While DRIVE_TO_WAYPOINT is commanding forward motion, A.M.A.S.O.N.
+# accumulates the amount of time it has actually tried to drive. If
+# it fails to get meaningfully closer to the current waypoint after
+# this much forward-commanded time, the robot declares itself stuck.
+STUCK_FORWARD_ATTEMPT_SECONDS = 2.0
+STUCK_MINIMUM_WAYPOINT_PROGRESS_METERS = 0.12
+
+# A stuck recovery backs farther than an ordinary emergency reaction
+# so the chassis has room to clear an object it may be touching.
+STUCK_BACKTRACK_DURATION_SECONDS = 2.25
 
 # Wheel geometry used by the localization motion model.
 WHEEL_RADIUS_METERS = 0.075
@@ -131,21 +161,31 @@ GRID_CELL_SIZE_METERS = 0.25
 GRID_CELL_COUNT = int(ARENA_SIZE_METERS / GRID_CELL_SIZE_METERS)
 ARENA_MINIMUM_COORDINATE = -ARENA_SIZE_METERS / 2.0
 
-BOX_ONE_CENTER_X = 1.20
-BOX_ONE_CENTER_Y = 0.40
-BOX_ONE_SIZE_X = 0.20
-BOX_ONE_SIZE_Y = 0.40
+# Known green obstacles. These are included in the robot's static map.
+# Format: (name, center_x, center_y, size_x, size_y)
+STATIC_OBSTACLES = [
+    ("Known Obstacle 1", 1.20, 0.40, 0.20, 0.40),
+    ("Known Obstacle 2", 0.70, 1.10, 0.20, 0.40),
+    ("Known Obstacle 3", -1.20, -1.20, 0.22, 0.22),
+    ("Known Obstacle 4", 0.00, -1.25, 0.22, 0.22),
+    ("Known Obstacle 5", 1.20, -1.10, 0.22, 0.22),
+    ("Known Obstacle 6", -1.65, -0.10, 0.22, 0.22),
+    ("Known Obstacle 7", -0.45, -0.05, 0.22, 0.22),
+    ("Known Obstacle 8", -1.15, 1.10, 0.22, 0.22),
+    ("Known Obstacle 9", 0.10, 1.70, 0.22, 0.22),
+    ("Known Obstacle 10", 1.55, 1.50, 0.22, 0.22),
+    ("Known Obstacle 11", -0.45, 0.85, 0.22, 0.22),
+    ("Known Obstacle 12", -1.65, 1.65, 0.22, 0.22),
+]
 
-BOX_TWO_CENTER_X = 0.70
-BOX_TWO_CENTER_Y = 1.10
-BOX_TWO_SIZE_X = 0.20
-BOX_TWO_SIZE_Y = 0.40
+STATIC_OBSTACLE_SAFETY_MARGIN = 0.18
 
-STATIC_OBSTACLE_SAFETY_MARGIN = 0.30
+# Corner-to-corner navigation test.
+ROBOT_START_WORLD_POSITION = (-2.0, -2.0)
+SINGLE_GOAL_WORLD_POSITION = (2.0, 2.0)
 
-ROBOT_START_WORLD_POSITION = (0.0, 0.0)
-
-# Autonomous patrol route. The robot cycles through these forever.
+# Patrol code is intentionally retained, but disabled for this iteration.
+PATROL_ENABLED = False
 PATROL_LOCATIONS = [
     (1.80, 1.20),
     (-1.50, 1.50),
@@ -629,6 +669,17 @@ def mark_rectangular_obstacle_on_grid(
 
 
 def mark_temporary_obstacle_on_grid(occupancy_grid, obstacle_grid_cell):
+    """
+    Mark a remembered temporary obstacle with a full one-cell safety
+    buffer. On the 0.25 m grid this produces a 3 x 3 blocked region.
+
+    This is intentionally conservative. The previous CORE_ONLY fallback
+    allowed A* to route the robot through a cell directly beside an
+    obstacle. Because A.M.A.S.O.N. is about 0.5 m long and 0.4 m wide,
+    that mathematically valid grid route was not physically safe and
+    caused repeated BACKTRACK/replan loops.
+    """
+
     obstacle_grid_column, obstacle_grid_row = obstacle_grid_cell
 
     for column_offset in range(
@@ -648,6 +699,19 @@ def mark_temporary_obstacle_on_grid(occupancy_grid, obstacle_grid_cell):
             ):
                 occupancy_grid[blocked_grid_column][blocked_grid_row] = 1
 
+def mark_arena_boundary_on_grid(occupancy_grid):
+    """Mark the physical arena walls as known blocked cells."""
+
+    for boundary_offset in range(ARENA_BOUNDARY_BLOCKED_CELLS):
+        minimum_index = boundary_offset
+        maximum_index = GRID_CELL_COUNT - 1 - boundary_offset
+
+        for grid_index in range(GRID_CELL_COUNT):
+            occupancy_grid[minimum_index][grid_index] = 1
+            occupancy_grid[maximum_index][grid_index] = 1
+            occupancy_grid[grid_index][minimum_index] = 1
+            occupancy_grid[grid_index][maximum_index] = 1
+
 
 temporary_obstacles = {}
 
@@ -665,20 +729,100 @@ def remove_expired_temporary_obstacles(current_simulation_time):
         print("Temporary obstacle expired:", obstacle_grid_cell)
 
 
+def grid_cells_represent_same_temporary_obstacle(
+    first_grid_cell,
+    second_grid_cell,
+):
+    """
+    Compare two detections using Euclidean grid distance.
+
+    A two-cell radius allows noisy position estimates of the same
+    physical obstacle to be consolidated without using the broader
+    square comparison that could merge more distant objects.
+    """
+
+    column_difference = first_grid_cell[0] - second_grid_cell[0]
+    row_difference = first_grid_cell[1] - second_grid_cell[1]
+
+    squared_grid_distance = (
+        column_difference ** 2
+        + row_difference ** 2
+    )
+
+    return (
+        squared_grid_distance
+        <= TEMPORARY_OBSTACLE_MATCH_RADIUS_CELLS ** 2
+    )
+
+
 def find_matching_temporary_obstacle(detected_grid_cell):
-    detected_grid_column, detected_grid_row = detected_grid_cell
+    """Return the nearest remembered obstacle within the match radius."""
+
+    nearest_matching_grid_cell = None
+    nearest_squared_distance = None
 
     for existing_grid_cell in temporary_obstacles.keys():
-        column_difference = abs(existing_grid_cell[0] - detected_grid_column)
-        row_difference = abs(existing_grid_cell[1] - detected_grid_row)
+        if not grid_cells_represent_same_temporary_obstacle(
+            detected_grid_cell,
+            existing_grid_cell,
+        ):
+            continue
+
+        column_difference = existing_grid_cell[0] - detected_grid_cell[0]
+        row_difference = existing_grid_cell[1] - detected_grid_cell[1]
+        squared_distance = column_difference ** 2 + row_difference ** 2
 
         if (
-            column_difference <= TEMPORARY_OBSTACLE_MATCH_RADIUS_CELLS
-            and row_difference <= TEMPORARY_OBSTACLE_MATCH_RADIUS_CELLS
+            nearest_squared_distance is None
+            or squared_distance < nearest_squared_distance
         ):
-            return existing_grid_cell
+            nearest_matching_grid_cell = existing_grid_cell
+            nearest_squared_distance = squared_distance
 
-    return None
+    return nearest_matching_grid_cell
+
+
+def consolidate_temporary_obstacles():
+    """
+    Merge duplicate remembered cells that are likely observations of
+    the same physical temporary object. The most recently observed
+    cell is retained as the canonical cell.
+    """
+
+    if len(temporary_obstacles) < 2:
+        return
+
+    detections_newest_first = sorted(
+        temporary_obstacles.items(),
+        key=lambda obstacle_item: obstacle_item[1],
+        reverse=True,
+    )
+
+    consolidated_obstacles = {}
+
+    for obstacle_grid_cell, last_detection_time in detections_newest_first:
+        matches_existing_cell = False
+
+        for retained_grid_cell in consolidated_obstacles.keys():
+            if grid_cells_represent_same_temporary_obstacle(
+                obstacle_grid_cell,
+                retained_grid_cell,
+            ):
+                matches_existing_cell = True
+                break
+
+        if not matches_existing_cell:
+            consolidated_obstacles[obstacle_grid_cell] = last_detection_time
+
+    if len(consolidated_obstacles) != len(temporary_obstacles):
+        removed_count = len(temporary_obstacles) - len(consolidated_obstacles)
+        temporary_obstacles.clear()
+        temporary_obstacles.update(consolidated_obstacles)
+        print(
+            "Consolidated",
+            removed_count,
+            "duplicate temporary obstacle detection(s).",
+        )
 
 
 def add_or_refresh_temporary_obstacle(detected_grid_cell, current_simulation_time):
@@ -689,18 +833,34 @@ def add_or_refresh_temporary_obstacle(detected_grid_cell, current_simulation_tim
         return matching_obstacle_cell
 
     temporary_obstacles[detected_grid_cell] = current_simulation_time
-    return detected_grid_cell
+    consolidate_temporary_obstacles()
+
+    matching_obstacle_cell = find_matching_temporary_obstacle(detected_grid_cell)
+    return matching_obstacle_cell or detected_grid_cell
 
 
 def build_current_occupancy_grid(current_simulation_time):
+    """
+    Build the planning map from known static obstacles, arena walls,
+    and all remembered temporary obstacles.
+
+    Temporary obstacles always retain their full safety buffer. The
+    planner no longer falls back to CORE_ONLY routes because those routes
+    can be too narrow for the physical robot even when a grid path exists.
+    """
+
     remove_expired_temporary_obstacles(current_simulation_time)
+    consolidate_temporary_obstacles()
+
     combined_occupancy_grid = copy_occupancy_grid(static_occupancy_grid)
 
     for obstacle_grid_cell in temporary_obstacles.keys():
-        mark_temporary_obstacle_on_grid(combined_occupancy_grid, obstacle_grid_cell)
+        mark_temporary_obstacle_on_grid(
+            combined_occupancy_grid,
+            obstacle_grid_cell,
+        )
 
     return combined_occupancy_grid
-
 
 def grid_cell_is_static_obstacle(grid_cell):
     return static_occupancy_grid[grid_cell[0]][grid_cell[1]] == 1
@@ -838,32 +998,71 @@ def calculate_route(
     goal_world_position,
     current_simulation_time,
 ):
-    current_occupancy_grid = build_current_occupancy_grid(current_simulation_time)
-    starting_grid_cell = convert_world_position_to_grid_cell(start_world_x, start_world_y)
+    """
+    Calculate a route with progressively less conservative temporary
+    obstacle clearance. Static obstacles and arena walls are never
+    relaxed. Temporary obstacle memory is also never deleted here.
+    """
+
+    starting_grid_cell = convert_world_position_to_grid_cell(
+        start_world_x,
+        start_world_y,
+    )
     goal_grid_cell = convert_world_position_to_grid_cell(
-        goal_world_position[0], goal_world_position[1]
+        goal_world_position[0],
+        goal_world_position[1],
     )
 
-    # Obstacle inflation may overlap the cell currently occupied by the robot.
-    current_occupancy_grid[starting_grid_cell[0]][starting_grid_cell[1]] = 0
+    # Use one physically safe planning map. Earlier versions progressively
+    # relaxed temporary-obstacle clearance to CORE_ONLY. That could produce
+    # a grid path that passed too close to an obstacle for the robot body.
+    planning_clearance_modes = ["NORMAL"]
 
-    raw_grid_path = calculate_astar_path(
-        current_occupancy_grid,
-        starting_grid_cell,
-        goal_grid_cell,
-    )
-    simplified_grid_path = simplify_grid_path(raw_grid_path)
-    navigation_waypoints = create_navigation_waypoints(
-        simplified_grid_path,
-        goal_world_position,
-    )
+    for planning_clearance_mode in planning_clearance_modes:
+        current_occupancy_grid = build_current_occupancy_grid(
+            current_simulation_time,
+        )
+
+        # Temporary obstacle inflation can overlap the grid cell the
+        # robot currently occupies. The current cell must remain usable
+        # so A* can plan an escape from its present position.
+        current_occupancy_grid[
+            starting_grid_cell[0]
+        ][
+            starting_grid_cell[1]
+        ] = 0
+
+        raw_grid_path = calculate_astar_path(
+            current_occupancy_grid,
+            starting_grid_cell,
+            goal_grid_cell,
+        )
+
+        if raw_grid_path is None:
+            continue
+
+        simplified_grid_path = simplify_grid_path(raw_grid_path)
+        navigation_waypoints = create_navigation_waypoints(
+            simplified_grid_path,
+            goal_world_position,
+        )
+
+        return (
+            raw_grid_path,
+            simplified_grid_path,
+            navigation_waypoints,
+            starting_grid_cell,
+            goal_grid_cell,
+            planning_clearance_mode,
+        )
 
     return (
-        raw_grid_path,
-        simplified_grid_path,
-        navigation_waypoints,
+        None,
+        None,
+        [],
         starting_grid_cell,
         goal_grid_cell,
+        "NO_PATH",
     )
 
 
@@ -963,44 +1162,43 @@ def estimate_obstacle_world_position(
 # =========================================================
 
 static_occupancy_grid = create_empty_occupancy_grid()
+mark_arena_boundary_on_grid(static_occupancy_grid)
 
-mark_rectangular_obstacle_on_grid(
-    static_occupancy_grid,
-    BOX_ONE_CENTER_X,
-    BOX_ONE_CENTER_Y,
-    BOX_ONE_SIZE_X,
-    BOX_ONE_SIZE_Y,
-    STATIC_OBSTACLE_SAFETY_MARGIN,
-)
+for (
+    static_obstacle_name,
+    static_obstacle_center_x,
+    static_obstacle_center_y,
+    static_obstacle_size_x,
+    static_obstacle_size_y,
+) in STATIC_OBSTACLES:
+    mark_rectangular_obstacle_on_grid(
+        static_occupancy_grid,
+        static_obstacle_center_x,
+        static_obstacle_center_y,
+        static_obstacle_size_x,
+        static_obstacle_size_y,
+        STATIC_OBSTACLE_SAFETY_MARGIN,
+    )
 
-mark_rectangular_obstacle_on_grid(
-    static_occupancy_grid,
-    BOX_TWO_CENTER_X,
-    BOX_TWO_CENTER_Y,
-    BOX_TWO_SIZE_X,
-    BOX_TWO_SIZE_Y,
-    STATIC_OBSTACLE_SAFETY_MARGIN,
-)
-
-# Localization uses physical obstacle footprints rather than
-# the larger planning safety margins.
+# Localization uses the physical footprints of every known green
+# obstacle rather than the larger planning safety margins.
 localization_occupancy_grid = create_empty_occupancy_grid()
-mark_rectangular_obstacle_on_grid(
-    localization_occupancy_grid,
-    BOX_ONE_CENTER_X,
-    BOX_ONE_CENTER_Y,
-    BOX_ONE_SIZE_X,
-    BOX_ONE_SIZE_Y,
-    0.0,
-)
-mark_rectangular_obstacle_on_grid(
-    localization_occupancy_grid,
-    BOX_TWO_CENTER_X,
-    BOX_TWO_CENTER_Y,
-    BOX_TWO_SIZE_X,
-    BOX_TWO_SIZE_Y,
-    0.0,
-)
+mark_arena_boundary_on_grid(localization_occupancy_grid)
+for (
+    static_obstacle_name,
+    static_obstacle_center_x,
+    static_obstacle_center_y,
+    static_obstacle_size_x,
+    static_obstacle_size_y,
+) in STATIC_OBSTACLES:
+    mark_rectangular_obstacle_on_grid(
+        localization_occupancy_grid,
+        static_obstacle_center_x,
+        static_obstacle_center_y,
+        static_obstacle_size_x,
+        static_obstacle_size_y,
+        0.0,
+    )
 
 observed_occupancy_grid = create_observed_occupancy_grid()
 for initialization_grid_column in range(GRID_CELL_COUNT):
@@ -1030,19 +1228,35 @@ heading_correction_count = 0
 patrol_points_reached_count = 0
 backtrack_count = 0
 escape_turn_count = 0
+stuck_recovery_count = 0
 total_distance_traveled_meters = 0.0
 previous_actual_robot_world_position = None
 
 consecutive_no_path_count = 0
+last_local_escape_completion_time = -LOCAL_ESCAPE_COOLDOWN_SECONDS
+escape_drive_start_time = 0.0
+escape_turn_direction = 1.0
 backtrack_start_time = 0.0
 backtrack_reason = ""
 escape_turn_target_yaw = 0.0
+
+# Stuck-detection watchdog. The reference distance is reset whenever
+# the robot makes real progress toward its current waypoint. Small
+# heading-correction turns do not reset the watchdog, which is important
+# when the chassis is caught on an object and alternates between TURN
+# and DRIVE states without actually going anywhere.
+stuck_monitor_target = None
+stuck_progress_reference_distance = None
+stuck_forward_attempt_seconds = 0.0
 previous_control_loop_time = amason_robot.getTime()
 last_localization_update_time = amason_robot.getTime()
 commanded_linear_distance_since_localization_update = 0.0
 
 current_patrol_location_index = 0
-current_patrol_goal_world_position = PATROL_LOCATIONS[current_patrol_location_index]
+if PATROL_ENABLED:
+    current_patrol_goal_world_position = PATROL_LOCATIONS[current_patrol_location_index]
+else:
+    current_patrol_goal_world_position = SINGLE_GOAL_WORLD_POSITION
 
 (
     raw_grid_path,
@@ -1050,6 +1264,7 @@ current_patrol_goal_world_position = PATROL_LOCATIONS[current_patrol_location_in
     navigation_waypoints,
     starting_grid_cell,
     goal_grid_cell,
+    active_planning_clearance_mode,
 ) = calculate_route(
     ROBOT_START_WORLD_POSITION[0],
     ROBOT_START_WORLD_POSITION[1],
@@ -1107,6 +1322,8 @@ navigation_log_writer.writerow(
         "ObservedMapCellCount",
         "BacktrackCount",
         "EscapeTurnCount",
+        "StuckRecoveryCount",
+        "PlanningClearanceMode",
     ]
 )
 
@@ -1124,10 +1341,18 @@ pending_event_world_y = ""
 
 print()
 print("==========================================")
-print("A.M.A.S.O.N. AUTONOMOUS PATROL")
+if PATROL_ENABLED:
+    print("A.M.A.S.O.N. AUTONOMOUS PATROL")
+else:
+    print("A.M.A.S.O.N. CORNER-TO-CORNER NAVIGATION")
 print("==========================================")
 print("Start location:", ROBOT_START_WORLD_POSITION)
-print("Patrol point:", current_patrol_location_index + 1, current_patrol_goal_world_position)
+if PATROL_ENABLED:
+    print("Patrol point:", current_patrol_location_index + 1, current_patrol_goal_world_position)
+else:
+    print("Goal location:", current_patrol_goal_world_position)
+    print("Patrolling: OFF (patrol route retained in code)")
+print("Known static obstacles:", len(STATIC_OBSTACLES))
 
 if raw_grid_path is None:
     print("ERROR: A* COULD NOT FIND AN INITIAL PATH")
@@ -1140,7 +1365,15 @@ print("CSV log:", LOG_FILE_PATH)
 print("Localization: Markov prediction + Bayesian noisy-GPS correction")
 print("GPS noise sigma:", GPS_NOISE_STANDARD_DEVIATION_METERS, "meters")
 print("Distance sensor noise sigma:", DISTANCE_SENSOR_NOISE_STANDARD_DEVIATION)
-print("Local escape behavior: BACKTRACK -> ESCAPE_TURN -> PLAN_ROUTE")
+print("Local escape behavior: BACKTRACK -> ESCAPE_TURN -> ESCAPE_DRIVE -> PLAN_ROUTE")
+print(
+    "Stuck detection:",
+    f"{STUCK_FORWARD_ATTEMPT_SECONDS:.1f}s forward attempt with less than ",
+    f"{STUCK_MINIMUM_WAYPOINT_PROGRESS_METERS:.2f}m waypoint progress",
+)
+print("Temporary obstacle memory:", TEMPORARY_OBSTACLE_LIFETIME_SECONDS, "seconds")
+print("Arena wall cells blocked:", ARENA_BOUNDARY_BLOCKED_CELLS)
+print("Initial temporary clearance mode:", active_planning_clearance_mode)
 print("==========================================")
 print()
 
@@ -1331,29 +1564,45 @@ while amason_robot.step(SIMULATION_TIME_STEP) != -1:
         detection_is_known_static_obstacle = grid_cell_is_static_obstacle(
             detected_obstacle_grid_cell
         )
-        matching_temporary_obstacle_cell = find_matching_temporary_obstacle(
-            detected_obstacle_grid_cell
-        )
 
-        if matching_temporary_obstacle_cell is not None:
-            temporary_obstacles[matching_temporary_obstacle_cell] = current_simulation_time
+        if not detection_is_known_static_obstacle:
+            matching_temporary_obstacle_cell = find_matching_temporary_obstacle(
+                detected_obstacle_grid_cell
+            )
+
+            if matching_temporary_obstacle_cell is not None:
+                temporary_obstacles[matching_temporary_obstacle_cell] = (
+                    current_simulation_time
+                )
 
     # -----------------------------------------------------
     # EMERGENCY LOCAL REACTIVE AVOIDANCE
     # -----------------------------------------------------
-    # This is deliberately independent of A*. If the robot
-    # gets very close to an object, it backs away first and
-    # then turns toward the clearer side before replanning.
+    # New/unknown obstacles are handled by CONFIRM_OBSTACLE first so they
+    # are added to the occupancy map before any escape maneuver. The
+    # emergency backtrack is reserved for a dangerously close obstacle
+    # that is already known (static or remembered temporary obstacle).
+    #
+    # Only the FRONT sensor starts an emergency backtrack. A close object
+    # beside the robot should not repeatedly reverse the robot when the
+    # forward path itself is clear.
 
-    closest_sensor_value = min(
-        front_obstacle_distance_value,
-        left_obstacle_distance_value,
-        right_obstacle_distance_value,
+    obstacle_is_already_known = (
+        closest_obstacle_detection is not None
+        and (
+            detection_is_known_static_obstacle
+            or matching_temporary_obstacle_cell is not None
+        )
     )
 
     if (
         navigation_state == "DRIVE_TO_WAYPOINT"
-        and closest_sensor_value < EMERGENCY_OBSTACLE_THRESHOLD
+        and obstacle_is_already_known
+        and front_obstacle_distance_value < EMERGENCY_OBSTACLE_THRESHOLD
+        and (
+            current_simulation_time - last_local_escape_completion_time
+            >= LOCAL_ESCAPE_COOLDOWN_SECONDS
+        )
     ):
         left_wheel_motor.setVelocity(0.0)
         right_wheel_motor.setVelocity(0.0)
@@ -1363,7 +1612,7 @@ while amason_robot.step(SIMULATION_TIME_STEP) != -1:
         navigation_state = "BACKTRACK"
         pending_log_events.append("BACKTRACK_STARTED")
         print(
-            "Emergency obstacle range detected. "
+            "Known obstacle dangerously close in front. "
             "Starting local BACKTRACK behavior."
         )
 
@@ -1385,6 +1634,111 @@ while amason_robot.step(SIMULATION_TIME_STEP) != -1:
             "sensor at grid cell",
             detected_obstacle_grid_cell,
         )
+
+    # -----------------------------------------------------
+    # STUCK / NO-PROGRESS WATCHDOG
+    # -----------------------------------------------------
+    # The distance sensors cannot detect every physical contact. For
+    # example, the front corner of the chassis can catch an obstacle
+    # while the front range sensor still sees open space. Detect that
+    # condition by watching whether commanded forward motion actually
+    # reduces the distance to the current waypoint.
+
+    current_stuck_watch_target = None
+    current_stuck_watch_distance = None
+
+    if current_waypoint_index < len(navigation_waypoints):
+        current_stuck_watch_target = navigation_waypoints[current_waypoint_index]
+        current_stuck_watch_distance = math.hypot(
+            current_stuck_watch_target[0] - robot_world_x_position,
+            current_stuck_watch_target[1] - robot_world_y_position,
+        )
+
+    # A new waypoint or a newly planned route starts a fresh progress
+    # measurement. Compare the coordinate pair rather than only the
+    # waypoint index because replanning can reuse index zero for a
+    # completely different target.
+    if current_stuck_watch_target != stuck_monitor_target:
+        stuck_monitor_target = current_stuck_watch_target
+        stuck_progress_reference_distance = current_stuck_watch_distance
+        stuck_forward_attempt_seconds = 0.0
+
+    # Recovery/planning states intentionally reset the watchdog. The
+    # next navigation attempt gets a clean progress measurement.
+    if navigation_state in (
+        "CONFIRM_OBSTACLE",
+        "PLAN_ROUTE",
+        "WAIT_FOR_PATH",
+        "BACKTRACK",
+        "ESCAPE_TURN",
+        "ESCAPE_DRIVE",
+        "PATROL_POINT_REACHED",
+        "GOAL_REACHED",
+        "STOPPED",
+    ):
+        stuck_monitor_target = None
+        stuck_progress_reference_distance = None
+        stuck_forward_attempt_seconds = 0.0
+
+    elif (
+        current_stuck_watch_target is not None
+        and current_stuck_watch_distance is not None
+    ):
+        if stuck_progress_reference_distance is None:
+            stuck_progress_reference_distance = current_stuck_watch_distance
+
+        waypoint_progress_meters = (
+            stuck_progress_reference_distance - current_stuck_watch_distance
+        )
+
+        # Meaningful progress creates a new checkpoint.
+        if waypoint_progress_meters >= STUCK_MINIMUM_WAYPOINT_PROGRESS_METERS:
+            stuck_progress_reference_distance = current_stuck_watch_distance
+            stuck_forward_attempt_seconds = 0.0
+
+        elif navigation_state == "DRIVE_TO_WAYPOINT":
+            # Count only time during which the controller is actually
+            # trying to drive forward. Time spent turning does not count.
+            stuck_forward_attempt_seconds += control_loop_delta_time
+
+            if (
+                stuck_forward_attempt_seconds >= STUCK_FORWARD_ATTEMPT_SECONDS
+                and (
+                    current_simulation_time - last_local_escape_completion_time
+                    >= LOCAL_ESCAPE_COOLDOWN_SECONDS
+                )
+            ):
+                left_wheel_motor.setVelocity(0.0)
+                right_wheel_motor.setVelocity(0.0)
+                backtrack_start_time = current_simulation_time
+                backtrack_reason = "STUCK_NO_PROGRESS"
+                backtrack_count += 1
+                stuck_recovery_count += 1
+                navigation_state = "BACKTRACK"
+                pending_log_events.append("STUCK_DETECTED")
+                pending_log_events.append("BACKTRACK_STARTED")
+
+                print()
+                print("==========================================")
+                print("A.M.A.S.O.N. STUCK - NO FORWARD PROGRESS")
+                print(
+                    "Forward attempt time:",
+                    f"{stuck_forward_attempt_seconds:.2f} seconds",
+                )
+                print(
+                    "Waypoint progress:",
+                    f"{waypoint_progress_meters:.3f} meters",
+                )
+                print("Current waypoint:", current_stuck_watch_target)
+                print("Backing away before attempting a new route.")
+                print("==========================================")
+                print()
+
+                # Prevent the same stale progress window from immediately
+                # firing again after the recovery maneuver.
+                stuck_monitor_target = None
+                stuck_progress_reference_distance = None
+                stuck_forward_attempt_seconds = 0.0
 
     # =====================================================
     # FINITE STATE MACHINE
@@ -1463,7 +1817,7 @@ while amason_robot.step(SIMULATION_TIME_STEP) != -1:
                             round(estimated_obstacle_world_y, 3),
                         ),
                     )
-                    print("Replanning patrol route...")
+                    print("Replanning route...")
                     print("==========================================")
                     print()
 
@@ -1477,6 +1831,7 @@ while amason_robot.step(SIMULATION_TIME_STEP) != -1:
             navigation_waypoints,
             starting_grid_cell,
             goal_grid_cell,
+            active_planning_clearance_mode,
         ) = calculate_route(
             robot_world_x_position,
             robot_world_y_position,
@@ -1514,14 +1869,18 @@ while amason_robot.step(SIMULATION_TIME_STEP) != -1:
             print("==========================================")
             print("A* PATH PLANNED")
             print("Reason:", planning_reason)
-            print(
-                "Patrol target:",
-                current_patrol_location_index + 1,
-                current_patrol_goal_world_position,
-            )
+            if PATROL_ENABLED:
+                print(
+                    "Patrol target:",
+                    current_patrol_location_index + 1,
+                    current_patrol_goal_world_position,
+                )
+            else:
+                print("Goal target:", current_patrol_goal_world_position)
             print("Raw A* cells:", len(raw_grid_path))
             print("Simplified cells:", len(planned_grid_path))
             print("Navigation waypoints:", len(navigation_waypoints))
+            print("Temporary obstacle clearance mode:", active_planning_clearance_mode)
             print("Localized start cell:", starting_grid_cell)
             print("==========================================")
             print()
@@ -1543,29 +1902,42 @@ while amason_robot.step(SIMULATION_TIME_STEP) != -1:
         left_wheel_motor.setVelocity(-BACKTRACK_WHEEL_SPEED)
         right_wheel_motor.setVelocity(-BACKTRACK_WHEEL_SPEED)
 
+        required_backtrack_duration_seconds = (
+            STUCK_BACKTRACK_DURATION_SECONDS
+            if backtrack_reason == "STUCK_NO_PROGRESS"
+            else BACKTRACK_DURATION_SECONDS
+        )
+
         if (
             current_simulation_time - backtrack_start_time
-            >= BACKTRACK_DURATION_SECONDS
+            >= required_backtrack_duration_seconds
         ):
             left_wheel_motor.setVelocity(0.0)
             right_wheel_motor.setVelocity(0.0)
 
             # Higher sensor values mean more open space.
             if left_obstacle_distance_value >= right_obstacle_distance_value:
-                escape_turn_target_yaw = normalize_angle_radians(
-                    robot_current_yaw + ESCAPE_TURN_ANGLE_RADIANS
-                )
+                escape_turn_direction = 1.0
             else:
-                escape_turn_target_yaw = normalize_angle_radians(
-                    robot_current_yaw - ESCAPE_TURN_ANGLE_RADIANS
-                )
+                escape_turn_direction = -1.0
+
+            escape_turn_target_yaw = normalize_angle_radians(
+                robot_current_yaw
+                + escape_turn_direction * ESCAPE_TURN_ANGLE_RADIANS
+            )
 
             escape_turn_count += 1
             navigation_state = "ESCAPE_TURN"
             pending_log_events.append("BACKTRACK_COMPLETE")
-            print(
-                "Backtrack complete. Turning toward clearer side before replanning."
-            )
+            if backtrack_reason == "STUCK_NO_PROGRESS":
+                print(
+                    "Stuck recovery backtrack complete. "
+                    "Turning toward clearer side before replanning."
+                )
+            else:
+                print(
+                    "Backtrack complete. Turning toward clearer side before replanning."
+                )
 
     elif navigation_state == "ESCAPE_TURN":
         escape_heading_error = normalize_angle_radians(
@@ -1575,16 +1947,55 @@ while amason_robot.step(SIMULATION_TIME_STEP) != -1:
         if abs(escape_heading_error) <= WAYPOINT_HEADING_TOLERANCE:
             left_wheel_motor.setVelocity(0.0)
             right_wheel_motor.setVelocity(0.0)
-            planning_reason = "LOCAL_ESCAPE"
-            navigation_state = "PLAN_ROUTE"
+            escape_drive_start_time = current_simulation_time
+            navigation_state = "ESCAPE_DRIVE"
             pending_log_events.append("ESCAPE_TURN_COMPLETE")
-            print("Local escape turn complete. Replanning route.")
+            print(
+                "Local escape turn complete. "
+                "Driving away from the blocked approach before replanning."
+            )
         elif escape_heading_error > 0.0:
             left_wheel_motor.setVelocity(-TURNING_WHEEL_SPEED)
             right_wheel_motor.setVelocity(TURNING_WHEEL_SPEED)
         else:
             left_wheel_motor.setVelocity(TURNING_WHEEL_SPEED)
             right_wheel_motor.setVelocity(-TURNING_WHEEL_SPEED)
+
+    elif navigation_state == "ESCAPE_DRIVE":
+        # The old behavior replanned immediately after turning in place.
+        # A* therefore saw essentially the same start cell and selected the
+        # same route again. This short forward motion makes the local escape
+        # change the robot's position before global replanning resumes.
+        if front_obstacle_distance_value < EMERGENCY_OBSTACLE_THRESHOLD:
+            left_wheel_motor.setVelocity(0.0)
+            right_wheel_motor.setVelocity(0.0)
+
+            # The first escape heading is still blocked. Continue turning in
+            # the same chosen direction by another 45 degrees.
+            escape_turn_target_yaw = normalize_angle_radians(
+                robot_current_yaw
+                + escape_turn_direction * ESCAPE_TURN_ANGLE_RADIANS
+            )
+            navigation_state = "ESCAPE_TURN"
+            pending_log_events.append("ESCAPE_DRIVE_BLOCKED")
+            print(
+                "Escape direction still blocked. "
+                "Turning farther away from the obstacle."
+            )
+        elif (
+            current_simulation_time - escape_drive_start_time
+            >= ESCAPE_DRIVE_DURATION_SECONDS
+        ):
+            left_wheel_motor.setVelocity(0.0)
+            right_wheel_motor.setVelocity(0.0)
+            last_local_escape_completion_time = current_simulation_time
+            planning_reason = "LOCAL_ESCAPE"
+            navigation_state = "PLAN_ROUTE"
+            pending_log_events.append("ESCAPE_DRIVE_COMPLETE")
+            print("Local escape movement complete. Replanning route.")
+        else:
+            left_wheel_motor.setVelocity(ESCAPE_DRIVE_WHEEL_SPEED)
+            right_wheel_motor.setVelocity(ESCAPE_DRIVE_WHEEL_SPEED)
 
     elif navigation_state == "TURN_TO_WAYPOINT":
         if current_waypoint_index >= len(navigation_waypoints):
@@ -1666,31 +2077,45 @@ while amason_robot.step(SIMULATION_TIME_STEP) != -1:
     elif navigation_state == "PATROL_POINT_REACHED":
         left_wheel_motor.setVelocity(0.0)
         right_wheel_motor.setVelocity(0.0)
-        patrol_points_reached_count += 1
-        pending_log_events.append("PATROL_POINT_REACHED")
 
-        print()
-        print(
-            "Patrol point",
-            current_patrol_location_index + 1,
-            "reached:",
-            current_patrol_goal_world_position,
-        )
+        if PATROL_ENABLED:
+            patrol_points_reached_count += 1
+            pending_log_events.append("PATROL_POINT_REACHED")
 
-        current_patrol_location_index = (
-            current_patrol_location_index + 1
-        ) % len(PATROL_LOCATIONS)
-        current_patrol_goal_world_position = PATROL_LOCATIONS[
-            current_patrol_location_index
-        ]
-        planning_reason = "NEXT_PATROL_POINT"
-        navigation_state = "PLAN_ROUTE"
+            print()
+            print(
+                "Patrol point",
+                current_patrol_location_index + 1,
+                "reached:",
+                current_patrol_goal_world_position,
+            )
 
-        print(
-            "Next patrol point:",
-            current_patrol_location_index + 1,
-            current_patrol_goal_world_position,
-        )
+            current_patrol_location_index = (
+                current_patrol_location_index + 1
+            ) % len(PATROL_LOCATIONS)
+            current_patrol_goal_world_position = PATROL_LOCATIONS[
+                current_patrol_location_index
+            ]
+            planning_reason = "NEXT_PATROL_POINT"
+            navigation_state = "PLAN_ROUTE"
+
+            print(
+                "Next patrol point:",
+                current_patrol_location_index + 1,
+                current_patrol_goal_world_position,
+            )
+        else:
+            pending_log_events.append("GOAL_REACHED")
+            navigation_state = "GOAL_REACHED"
+            print()
+            print("==========================================")
+            print("GOAL REACHED:", current_patrol_goal_world_position)
+            print("Corner-to-corner navigation complete.")
+            print("==========================================")
+
+    elif navigation_state == "GOAL_REACHED":
+        left_wheel_motor.setVelocity(0.0)
+        right_wheel_motor.setVelocity(0.0)
 
     elif navigation_state == "STOPPED":
         left_wheel_motor.setVelocity(0.0)
@@ -1748,6 +2173,8 @@ while amason_robot.step(SIMULATION_TIME_STEP) != -1:
                 observed_map_cell_count,
                 backtrack_count,
                 escape_turn_count,
+                stuck_recovery_count,
+                active_planning_clearance_mode,
             ]
         )
 
@@ -1784,6 +2211,12 @@ while amason_robot.step(SIMULATION_TIME_STEP) != -1:
             observed_occupancy_grid
         )
 
+        navigation_mode_description = (
+            f"Patrol={current_patrol_location_index + 1}/{len(PATROL_LOCATIONS)}"
+            if PATROL_ENABLED
+            else "Mode=SINGLE_GOAL"
+        )
+
         print(
             f"Actual=({actual_robot_world_x_position:.3f},"
             f"{actual_robot_world_y_position:.3f}), "
@@ -1793,13 +2226,15 @@ while amason_robot.step(SIMULATION_TIME_STEP) != -1:
             f"LocCell={localized_robot_grid_cell}, "
             f"LocConf={localization_confidence:.3f}, "
             f"Yaw={robot_current_yaw:.3f}, "
-            f"Patrol={current_patrol_location_index + 1}/{len(PATROL_LOCATIONS)}, "
+            f"{navigation_mode_description}, "
             f"Waypoint={waypoint_description}, "
             f"Target={current_target_description}, "
             f"ObservedCells={observed_map_cell_count}, "
             f"TempObstacles={len(temporary_obstacles)}, "
+            f"Clearance={active_planning_clearance_mode}, "
             f"Replans={dynamic_replan_count}, "
             f"Backtracks={backtrack_count}, "
+            f"StuckRecoveries={stuck_recovery_count}, "
             f"Distance={total_distance_traveled_meters:.2f}m, "
             f"State={navigation_state}"
         )

@@ -19,10 +19,24 @@ SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_LOG_PATH = os.path.join(SCRIPT_DIRECTORY, "amason_navigation_log.csv")
 
 STATIC_OBSTACLES = [
-    (1.20, 0.40, 0.20, 0.40, "Box 1"),
-    (0.70, 1.10, 0.20, 0.40, "Box 2"),
+    (1.20, 0.40, 0.20, 0.40, "K1"),
+    (0.70, 1.10, 0.20, 0.40, "K2"),
+    (-1.20, -1.20, 0.22, 0.22, "K3"),
+    (0.00, -1.25, 0.22, 0.22, "K4"),
+    (1.20, -1.10, 0.22, 0.22, "K5"),
+    (-1.65, -0.10, 0.22, 0.22, "K6"),
+    (-0.45, -0.05, 0.22, 0.22, "K7"),
+    (-1.15, 1.10, 0.22, 0.22, "K8"),
+    (0.10, 1.70, 0.22, 0.22, "K9"),
+    (1.55, 1.50, 0.22, 0.22, "K10"),
+    (-0.45, 0.85, 0.22, 0.22, "K11"),
+    (-1.65, 1.65, 0.22, 0.22, "K12"),
 ]
 
+PATROL_ENABLED = False
+SINGLE_GOAL_WORLD_POSITION = (2.0, 2.0)
+
+# Retained so the same visualizer can be switched back to patrol mode later.
 PATROL_LOCATIONS = [
     (1.80, 1.20),
     (-1.50, 1.50),
@@ -51,7 +65,10 @@ def print_performance_summary(rows):
     print("Path plans:", final_row["PathPlanCount"])
     print("Dynamic replans:", final_row["DynamicReplanCount"])
     print("Heading corrections:", final_row["HeadingCorrectionCount"])
-    print("Patrol points reached:", final_row["PatrolPointsReached"])
+    if PATROL_ENABLED:
+        print("Patrol points reached:", final_row["PatrolPointsReached"])
+    else:
+        print("Navigation mode: corner-to-corner single goal")
     print("==========================================")
 
 
@@ -73,9 +90,22 @@ def create_route_plot(rows):
         axes.add_patch(obstacle_rectangle)
         axes.text(center_x, center_y, name)
 
-    for patrol_number, patrol_location in enumerate(PATROL_LOCATIONS, start=1):
-        axes.scatter([patrol_location[0]], [patrol_location[1]], marker="x")
-        axes.text(patrol_location[0], patrol_location[1], f"P{patrol_number}")
+    if PATROL_ENABLED:
+        for patrol_number, patrol_location in enumerate(PATROL_LOCATIONS, start=1):
+            axes.scatter([patrol_location[0]], [patrol_location[1]], marker="x")
+            axes.text(patrol_location[0], patrol_location[1], f"P{patrol_number}")
+    else:
+        axes.scatter(
+            [SINGLE_GOAL_WORLD_POSITION[0]],
+            [SINGLE_GOAL_WORLD_POSITION[1]],
+            marker="x",
+            label="Goal",
+        )
+        axes.text(
+            SINGLE_GOAL_WORLD_POSITION[0],
+            SINGLE_GOAL_WORLD_POSITION[1],
+            "Goal",
+        )
 
     temporary_obstacle_x = []
     temporary_obstacle_y = []
@@ -97,7 +127,7 @@ def create_route_plot(rows):
             label="Detected temporary obstacles",
         )
 
-    axes.set_title("A.M.A.S.O.N. Navigation Trajectory")
+    axes.set_title("A.M.A.S.O.N. Corner-to-Corner Navigation Trajectory")
     axes.set_xlabel("World X (meters)")
     axes.set_ylabel("World Y (meters)")
     axes.set_xlim(-2.5, 2.5)
